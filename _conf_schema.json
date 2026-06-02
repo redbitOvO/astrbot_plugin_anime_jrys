@@ -1,0 +1,38 @@
+{
+  "wallhaven_keywords": {
+    "description": "Wallhaven 关键词",
+    "type": "text",
+    "hint": "多个关键词请用英文分号 ; 分隔。配置不为空时会优先使用 Wallhaven 关键词源。例如：wuthering waves;genshin impact;arknights",
+    "default": "genshin impact;honkai star rail;honkai impact 3rd;zenless zone zero;wuthering waves;arknights;blue archive;azur lane;girls frontline;nikke;punishing gray raven;snowbreak containment zone;path to nowhere;reverse 1999;fate grand order;umamusume"
+  },
+  "konachan_tags": {
+    "description": "Konachan 标签",
+    "type": "text",
+    "hint": "多个标签请用英文分号 ; 分隔。配置不为空时会优先使用 Konachan 标签源。例如：wuthering_waves;genshin_impact;arknights",
+    "default": "genshin_impact;honkai:_star_rail;honkai_impact;zenless_zone_zero;wuthering_waves;arknights;blue_archive;azur_lane;girls_frontline;goddess_of_victory:_nikke;punishing:_gray_raven;snowbreak:_containment_zone;path_to_nowhere;reverse:1999;fate/grand_order"
+  },
+  "enable_zhuqiy_fallback": {
+    "description": "启用 ZHUQIY 泛二次元兜底源",
+    "type": "bool",
+    "hint": "关键词源全部失败后，使用 ZHUQIY 的 PC 横图随机接口作为兜底。",
+    "default": true
+  },
+  "enable_waifu_im_fallback": {
+    "description": "启用 Waifu.im 泛二次元兜底源",
+    "type": "bool",
+    "hint": "关键词源和 ZHUQIY 都失败后，使用 Waifu.im 的横图接口作为兜底。",
+    "default": true
+  },
+  "show_image_source_notice": {
+    "description": "在海报底部显示图片来源",
+    "type": "bool",
+    "hint": "建议公开发布或上架插件市场时保持开启，以便提示图片来自第三方接口。",
+    "default": true
+  },
+  "font_path": {
+    "description": "自定义字体路径",
+    "type": "string",
+    "hint": "可选。Docker 或 Linux 环境中文乱码时，填写可用中文字体文件路径，例如 /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc。",
+    "default": ""
+  }
+}
