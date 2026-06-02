@@ -278,7 +278,8 @@ class AnimeJrysPlugin(Star):
 
             streak = self._next_streak(existing, today)
             score, tier, text = self._roll_fortune()
-            image = await self._fetch_random_image()
+            used_image_paths = self._today_used_image_paths(users)
+            image = await self._fetch_random_image(used_image_paths)
             avatar_path = await self._fetch_user_avatar(user_display)
             card_path = self._cards_dir / f"{today}_{user_key}.jpg"
             await asyncio.to_thread(
@@ -353,20 +354,23 @@ class AnimeJrysPlugin(Star):
                 return score, tier, random.choice(texts)
         return 100, "最高运势", random.choice(PERFECT_TEXTS)
 
-    async def _fetch_random_image(self) -> ImageCandidate:
+    async def _fetch_random_image(self, blocked_paths: set[str] | None = None) -> ImageCandidate:
+        blocked_paths = blocked_paths or set()
         if _config_bool(self.config, "enable_image_prefetch", True):
-            pooled = await self._take_from_image_pool()
+            pooled = await self._take_from_image_pool(blocked_paths)
             if pooled:
                 self._schedule_pool_refill()
                 return pooled
 
-        image = await self._fetch_random_image_live()
+        image = await self._fetch_random_image_live(blocked_paths)
         if _config_bool(self.config, "enable_image_prefetch", True):
-            await self._add_image_to_pool(image)
             self._schedule_pool_refill()
         return image
 
-    async def _fetch_random_image_live(self) -> ImageCandidate:
+    async def _fetch_random_image_live(
+        self, blocked_paths: set[str] | None = None
+    ) -> ImageCandidate:
+        blocked_paths = blocked_paths or set()
         session = await self._get_session()
         attempts = self._build_source_attempts()
 
@@ -379,6 +383,9 @@ class AnimeJrysPlugin(Star):
                     continue
                 local_path = await self._download_and_validate(session, candidate)
                 if local_path:
+                    if self._image_path_in_set(local_path, blocked_paths):
+                        logger.info(f"图片源 {source_name} 返回了今日已使用图片，已跳过")
+                        continue
                     return ImageCandidate(
                         source=candidate.source,
                         url=str(local_path),
@@ -394,16 +401,24 @@ class AnimeJrysPlugin(Star):
 
         raise RuntimeError("所有图片源均获取失败")
 
-    async def _take_from_image_pool(self) -> ImageCandidate | None:
+    async def _take_from_image_pool(self, blocked_paths: set[str] | None = None) -> ImageCandidate | None:
         if self._image_pool_size() <= 0:
             return None
-        entries = await asyncio.to_thread(self._load_image_pool)
-        valid_entries = [entry for entry in entries if self._pool_entry_is_valid(entry)]
-        if len(valid_entries) != len(entries):
-            await asyncio.to_thread(self._save_image_pool, valid_entries)
-        if not valid_entries:
-            return None
-        entry = random.choice(valid_entries)
+        blocked_paths = blocked_paths or set()
+        async with self._prefetch_lock:
+            entries = await asyncio.to_thread(self._load_image_pool)
+            valid_entries = [entry for entry in entries if self._pool_entry_is_valid(entry)]
+            available_entries = [
+                entry
+                for entry in valid_entries
+                if not self._pool_entry_is_blocked(entry, blocked_paths)
+            ]
+            if not available_entries:
+                await asyncio.to_thread(self._save_image_pool, available_entries)
+                return None
+            selected_index = random.randrange(len(available_entries))
+            entry = available_entries.pop(selected_index)
+            await asyncio.to_thread(self._save_image_pool, available_entries)
         return ImageCandidate(
             source=str(entry.get("source", "ImagePool")),
             url=str(entry.get("image_path", "")),
@@ -419,8 +434,16 @@ class AnimeJrysPlugin(Star):
         if not image.url or not Path(image.url).exists():
             return
         async with self._prefetch_lock:
+            blocked_paths = self._today_used_image_paths()
+            if self._image_path_in_set(Path(image.url), blocked_paths):
+                return
             entries = await asyncio.to_thread(self._load_image_pool)
-            entries = [entry for entry in entries if self._pool_entry_is_valid(entry)]
+            entries = [
+                entry
+                for entry in entries
+                if self._pool_entry_is_valid(entry)
+                and not self._pool_entry_is_blocked(entry, blocked_paths)
+            ]
             if any(str(entry.get("image_path", "")) == image.url for entry in entries):
                 return
             entries.append(
@@ -438,8 +461,14 @@ class AnimeJrysPlugin(Star):
         if not _config_bool(self.config, "enable_image_prefetch", True):
             return
         async with self._prefetch_lock:
+            blocked_paths = self._today_used_image_paths()
             entries = await asyncio.to_thread(self._load_image_pool)
-            entries = [entry for entry in entries if self._pool_entry_is_valid(entry)]
+            entries = [
+                entry
+                for entry in entries
+                if self._pool_entry_is_valid(entry)
+                and not self._pool_entry_is_blocked(entry, blocked_paths)
+            ]
             target = self._image_pool_size()
             if target <= 0:
                 await asyncio.to_thread(self._save_image_pool, [])
@@ -447,9 +476,17 @@ class AnimeJrysPlugin(Star):
             batch = self._image_pool_refill_batch()
             missing = max(0, target - len(entries))
             fetch_count = min(batch, missing)
-            for _ in range(fetch_count):
+            fetch_attempts = 0
+            max_fetch_attempts = max(fetch_count * 3, fetch_count)
+            while fetch_count > 0 and fetch_attempts < max_fetch_attempts:
+                fetch_attempts += 1
+                blocked_for_fetch = blocked_paths | {
+                    self._normalize_path_key(Path(str(entry.get("image_path", ""))))
+                    for entry in entries
+                    if str(entry.get("image_path", "")).strip()
+                }
                 try:
-                    image = await self._fetch_random_image_live()
+                    image = await self._fetch_random_image_live(blocked_for_fetch)
                 except Exception as exc:
                     logger.info(f"图片池预取失败，稍后重试: {type(exc).__name__}: {exc}")
                     break
@@ -472,6 +509,7 @@ class AnimeJrysPlugin(Star):
                         image.source,
                         image.keyword,
                     )
+                fetch_count -= 1
             await asyncio.to_thread(self._save_image_pool, entries[-target:])
 
     def _load_image_pool(self) -> list[dict[str, Any]]:
@@ -494,6 +532,10 @@ class AnimeJrysPlugin(Star):
     def _pool_entry_is_valid(self, entry: dict[str, Any]) -> bool:
         path = Path(str(entry.get("image_path", "")))
         return path.exists() and self._is_valid_landscape_image(path)
+
+    def _pool_entry_is_blocked(self, entry: dict[str, Any], blocked_paths: set[str]) -> bool:
+        path_text = str(entry.get("image_path", "") or "")
+        return bool(path_text) and self._normalize_path_key(Path(path_text)) in blocked_paths
 
     def _image_pool_size(self) -> int:
         return _config_int(self.config, "image_pool_size", 8, 0, 100)
@@ -564,9 +606,32 @@ class AnimeJrysPlugin(Star):
             self._delete_old_files(self._avatars_dir, max(1, avatar_days), now, protected)
 
         self._trim_cache_size(protected)
-        pool = [entry for entry in self._load_image_pool() if self._pool_entry_is_valid(entry)]
+        blocked_paths = self._today_used_image_paths(users)
+        pool = [
+            entry
+            for entry in self._load_image_pool()
+            if self._pool_entry_is_valid(entry)
+            and not self._pool_entry_is_blocked(entry, blocked_paths)
+        ]
         pool_size = self._image_pool_size()
         self._save_image_pool(pool[-pool_size:] if pool_size > 0 else [])
+
+    def _today_used_image_paths(self, users: dict[str, Any] | None = None) -> set[str]:
+        users = users if users is not None else self._load_users()
+        today = _today_str()
+        used: set[str] = set()
+        for value in users.values():
+            if not isinstance(value, dict):
+                continue
+            if str(value.get("day", "")) != today:
+                continue
+            image_path = str(value.get("image_path", "") or "").strip()
+            if image_path:
+                used.add(self._normalize_path_key(Path(image_path)))
+        return used
+
+    def _image_path_in_set(self, path: Path, path_set: set[str]) -> bool:
+        return self._normalize_path_key(path) in path_set
 
     def _protected_cache_paths(self, users: dict[str, Any]) -> set[Path]:
         protected: set[Path] = {self._users_file, self._pool_file}
@@ -644,6 +709,9 @@ class AnimeJrysPlugin(Star):
             return path.resolve()
         except OSError:
             return path.absolute()
+
+    def _normalize_path_key(self, path: Path) -> str:
+        return str(self._normalize_path(path))
 
     def _build_source_attempts(self) -> list[tuple[str, str]]:
         enable_wallhaven = _config_bool(self.config, "enable_wallhaven_source", True)
