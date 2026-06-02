@@ -67,6 +67,18 @@ DEFAULT_WALLHAVEN_KEYWORDS = (
     "fate grand order;umamusume"
 )
 DEFAULT_KONACHAN_TAGS = ""
+DEFAULT_SAFEBOORU_TAGS = (
+    "genshin_impact;honkai:_star_rail;honkai_impact;zenless_zone_zero;"
+    "wuthering_waves;arknights;blue_archive;azur_lane;girls_frontline;"
+    "goddess_of_victory:_nikke;punishing:_gray_raven;path_to_nowhere;"
+    "reverse:1999;fate/grand_order;umamusume"
+)
+DEFAULT_SAFEBOORU_EXCLUDED_TAGS = (
+    "underwear;bikini;swimsuit;lingerie;nude;naked;sex;explicit;animated_gif;"
+    "character_sheet;reference_sheet;sketch;comic;manga;ass;bottomless;kiss;"
+    "french_kiss;tongue;tongue_out;armpits;sports_bra;leotard;midriff;navel;"
+    "nipples;pectorals;bulge;spread_legs;wide_spread_legs;feet;soles"
+)
 
 TRIGGER_WORDS = {"jrys", "今日运势", "运势"}
 HTTP_HEADERS = {
@@ -111,6 +123,30 @@ def _config_get(config: Any, key: str, default: Any) -> Any:
     if isinstance(config, dict):
         return config.get(key, default)
     return getattr(config, key, default)
+
+
+def _config_bool(config: Any, key: str, default: bool) -> bool:
+    value = _config_get(config, key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enable", "enabled", "开启", "是"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disable", "disabled", "关闭", "否", ""}:
+            return False
+    return bool(value)
+
+
+def _config_int(config: Any, key: str, default: int, minimum: int, maximum: int) -> int:
+    value = _config_get(config, key, default)
+    try:
+        result = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        result = default
+    return max(minimum, min(maximum, result))
 
 
 def _split_semicolon(value: str) -> list[str]:
@@ -279,37 +315,43 @@ class AnimeJrysPlugin(Star):
                 if status in {403, 429}:
                     self._cooldown_source(source_name, status)
                 detail = f"{type(exc).__name__}: {exc}".strip()
-                logger.warning(f"图片源 {source_name} 获取失败: {detail}")
+                logger.info(f"图片源 {source_name} 本次不可用，继续尝试其他图源: {detail}")
 
         raise RuntimeError("所有图片源均获取失败")
 
     def _build_source_attempts(self) -> list[tuple[str, str]]:
+        enable_wallhaven = _config_bool(self.config, "enable_wallhaven_source", True)
+        enable_konachan = _config_bool(self.config, "enable_konachan_source", False)
+        enable_safebooru = _config_bool(self.config, "enable_safebooru_source", True)
         wallhaven_keywords = _split_semicolon(
             _config_get(self.config, "wallhaven_keywords", DEFAULT_WALLHAVEN_KEYWORDS)
         )
         konachan_tags = _split_semicolon(
             _config_get(self.config, "konachan_tags", DEFAULT_KONACHAN_TAGS)
         )
+        safebooru_tags = _split_semicolon(
+            _config_get(self.config, "safebooru_tags", DEFAULT_SAFEBOORU_TAGS)
+        )
         keyword_attempts: list[tuple[str, str]] = []
         fallback_attempts: list[tuple[str, str]] = []
 
         keyword_sources: list[tuple[str, list[str]]] = []
-        if wallhaven_keywords:
+        if enable_wallhaven and wallhaven_keywords:
             keyword_sources.append(("wallhaven", wallhaven_keywords))
-        if konachan_tags:
+        if enable_konachan and konachan_tags:
             keyword_sources.append(("konachan", konachan_tags))
+        if enable_safebooru and safebooru_tags:
+            keyword_sources.append(("safebooru", safebooru_tags))
 
         if keyword_sources:
             for name, values in keyword_sources:
-                sample = random.sample(values, k=min(len(values), 2))
-                keyword_attempts.extend((name, value) for value in sample)
+                keyword_attempts.append((name, random.choice(values)))
 
-        if bool(_config_get(self.config, "enable_zhuqiy_fallback", True)):
+        if _config_bool(self.config, "enable_zhuqiy_fallback", True):
             fallback_attempts.append(("zhuqiy", ""))
-        if bool(_config_get(self.config, "enable_waifu_im_fallback", True)):
+        if _config_bool(self.config, "enable_waifu_im_fallback", True):
             fallback_attempts.append(("waifu_im", ""))
 
-        random.shuffle(keyword_attempts)
         random.shuffle(fallback_attempts)
         return keyword_attempts + fallback_attempts
 
@@ -324,7 +366,7 @@ class AnimeJrysPlugin(Star):
     def _cooldown_source(self, source_name: str, status: int) -> None:
         seconds = 3600 if status == 403 else 600
         self._source_cooldowns[source_name] = time.time() + seconds
-        logger.warning(
+        logger.info(
             f"图片源 {source_name} 返回 HTTP {status}，已临时跳过 {seconds // 60} 分钟"
         )
 
@@ -333,6 +375,12 @@ class AnimeJrysPlugin(Star):
         if isinstance(status, int):
             return status
         return None
+
+    def _keyword_source_timeout_seconds(self) -> int:
+        return _config_int(self.config, "keyword_source_timeout_seconds", 8, 3, 30)
+
+    def _keyword_source_retries(self) -> int:
+        return _config_int(self.config, "keyword_source_retries", 1, 0, 3)
 
     async def _resolve_candidate(
         self,
@@ -347,7 +395,12 @@ class AnimeJrysPlugin(Star):
                 f"?q={query}&categories=010&purity=100&sorting=random"
                 "&atleast=1920x1080&ratios=16x9&per_page=8"
             )
-            data = await self._get_json(session, url)
+            data = await self._get_json(
+                session,
+                url,
+                timeout_seconds=self._keyword_source_timeout_seconds(),
+                retries=self._keyword_source_retries(),
+            )
             items = data.get("data", []) if isinstance(data, dict) else []
             random.shuffle(items)
             for item in items:
@@ -364,7 +417,12 @@ class AnimeJrysPlugin(Star):
         if source_name == "konachan":
             tags = quote_plus(f"rating:safe {keyword} width:>=1920 height:>=1080")
             url = f"https://konachan.net/post.json?limit=8&tags={tags}"
-            data = await self._get_json(session, url)
+            data = await self._get_json(
+                session,
+                url,
+                timeout_seconds=self._keyword_source_timeout_seconds(),
+                retries=0,
+            )
             items = data if isinstance(data, list) else []
             random.shuffle(items)
             for item in items:
@@ -377,6 +435,47 @@ class AnimeJrysPlugin(Star):
                         credit_url=f"https://konachan.net/post/show/{item.get('id', '')}",
                     )
             return None
+
+        if source_name == "safebooru":
+            min_score = _config_int(self.config, "safebooru_min_score", 5, 0, 100)
+            excluded_tags = _split_semicolon(
+                _config_get(
+                    self.config,
+                    "safebooru_excluded_tags",
+                    DEFAULT_SAFEBOORU_EXCLUDED_TAGS,
+                )
+            )
+            query_parts = [
+                "rating:safe",
+                keyword,
+                "sort:score:desc",
+                f"score:>={min_score}",
+            ]
+            query_parts.extend(f"-{tag}" for tag in excluded_tags)
+            tags = quote_plus(" ".join(query_parts))
+            url = (
+                "https://safebooru.org/index.php"
+                f"?page=dapi&s=post&q=index&json=1&limit=100&tags={tags}"
+            )
+            data = await self._get_json(
+                session,
+                url,
+                timeout_seconds=self._keyword_source_timeout_seconds(),
+                retries=self._keyword_source_retries(),
+            )
+            items = data if isinstance(data, list) else []
+            picked = self._pick_safebooru_item(items, min_score, excluded_tags)
+            if not picked:
+                return None
+            path = picked.get("file_url") or picked.get("sample_url")
+            if not path:
+                return None
+            return ImageCandidate(
+                source="Safebooru",
+                url=path,
+                keyword=keyword,
+                credit_url=f"https://safebooru.org/index.php?page=post&s=view&id={picked.get('id', '')}",
+            )
 
         if source_name == "zhuqiy":
             return ImageCandidate(
@@ -404,10 +503,75 @@ class AnimeJrysPlugin(Star):
 
         return None
 
-    async def _get_json(self, session: aiohttp.ClientSession, url: str) -> Any:
-        async with session.get(url, headers=HTTP_HEADERS) as resp:
-            resp.raise_for_status()
-            return await resp.json(content_type=None)
+    def _pick_safebooru_item(
+        self,
+        items: list[Any],
+        min_score: int,
+        excluded_tags: list[str],
+    ) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+        excluded = {tag.lower().strip().replace(" ", "_") for tag in excluded_tags if tag.strip()}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tags = {
+                tag.lower().strip()
+                for tag in str(item.get("tags", "")).replace("\n", " ").split()
+                if tag.strip()
+            }
+            if tags.intersection(excluded):
+                continue
+            try:
+                width = int(item.get("width", 0) or 0)
+                height = int(item.get("height", 0) or 0)
+                score = int(item.get("score", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if score < min_score:
+                continue
+            if width < 1000 or height < 700 or width / max(height, 1) < 1.1:
+                continue
+            path = str(item.get("file_url") or item.get("sample_url") or "")
+            if not path:
+                continue
+            suffix = Path(urlparse(path).path).suffix.lower()
+            if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+                continue
+            candidates.append(item)
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: int(item.get("score", 0) or 0), reverse=True)
+        return random.choice(candidates[: min(len(candidates), 12)])
+
+    async def _get_json(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        *,
+        timeout_seconds: int | None = None,
+        retries: int = 0,
+    ) -> Any:
+        attempts = max(0, retries) + 1
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds) if timeout_seconds else None
+        last_exc: Exception | None = None
+        for index in range(attempts):
+            try:
+                kwargs: dict[str, Any] = {"headers": HTTP_HEADERS}
+                if timeout:
+                    kwargs["timeout"] = timeout
+                async with session.get(url, **kwargs) as resp:
+                    resp.raise_for_status()
+                    return await resp.json(content_type=None)
+            except Exception as exc:
+                last_exc = exc
+                status = self._status_from_exception(exc)
+                if index >= attempts - 1 or status in {401, 403, 404}:
+                    raise
+                await asyncio.sleep(0.35 * (index + 1))
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("JSON 请求失败")
 
     async def _download_and_validate(
         self,
@@ -430,7 +594,7 @@ class AnimeJrysPlugin(Star):
                 if "image" not in content_type.lower() and not data.startswith(
                     (b"\xff\xd8", b"\x89PNG", b"RIFF")
                 ):
-                    logger.warning(f"跳过非图片响应: {candidate.source} {content_type}")
+                    logger.info(f"跳过非图片响应: {candidate.source} {content_type}")
                     return None
             await asyncio.to_thread(tmp.write_bytes, data)
             if not await asyncio.to_thread(self._is_valid_landscape_image, tmp):
@@ -453,7 +617,7 @@ class AnimeJrysPlugin(Star):
                 width, height = img.size
                 return width >= 1000 and height >= 700 and width / max(height, 1) >= 1.1
         except Exception as exc:
-            logger.warning(f"图片校验失败: {path} | {exc}")
+            logger.info(f"图片校验失败，继续尝试其他图片: {path} | {exc}")
             return False
 
     def _extension_from_url(self, url: str) -> str:
@@ -527,7 +691,7 @@ class AnimeJrysPlugin(Star):
             fill=(80, 74, 68),
         )
 
-        if bool(_config_get(self.config, "show_image_source_notice", True)):
+        if _config_bool(self.config, "show_image_source_notice", True):
             source_text = f"Image source: {image_source}"
             if image_keyword:
                 source_text += f" / {image_keyword}"

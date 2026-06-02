@@ -1,15 +1,63 @@
 {
+  "enable_wallhaven_source": {
+    "description": "启用 Wallhaven 关键词源",
+    "type": "bool",
+    "hint": "默认开启。Wallhaven 可以按二游关键词搜横图；如果你的云服务器访问 wallhaven.cc 经常超时，可以关闭。",
+    "default": true
+  },
   "wallhaven_keywords": {
     "description": "Wallhaven 关键词",
     "type": "text",
-    "hint": "多个关键词请用英文分号 ; 分隔。配置不为空时会优先使用 Wallhaven 关键词源。例如：wuthering waves;genshin impact;arknights",
+    "hint": "多个关键词请用英文分号 ; 分隔。仅在启用 Wallhaven 关键词源且配置不为空时生效。例如：wuthering waves;genshin impact;arknights",
     "default": "genshin impact;honkai star rail;honkai impact 3rd;zenless zone zero;wuthering waves;arknights;blue archive;azur lane;girls frontline;nikke;punishing gray raven;snowbreak containment zone;path to nowhere;reverse 1999;fate grand order;umamusume"
+  },
+  "enable_konachan_source": {
+    "description": "启用 Konachan 标签源",
+    "type": "bool",
+    "hint": "默认关闭。Konachan 在不少云服务器 IP 上会返回 403 Forbidden；只有确认服务器可访问时再开启。",
+    "default": false
   },
   "konachan_tags": {
     "description": "Konachan 标签",
     "type": "text",
-    "hint": "多个标签请用英文分号 ; 分隔。部分云服务器访问 Konachan 会遇到 403，因此默认关闭。需要启用时可填写：wuthering_waves;genshin_impact;arknights",
+    "hint": "多个标签请用英文分号 ; 分隔。仅在启用 Konachan 标签源且配置不为空时生效。例如：wuthering_waves;genshin_impact;arknights",
     "default": ""
+  },
+  "enable_safebooru_source": {
+    "description": "启用 Safebooru 高分关键词源",
+    "type": "bool",
+    "hint": "默认开启。Safebooru 支持二游标签搜索，插件会优先取 score 较高、rating:safe、横图且不含排除标签的作品。",
+    "default": true
+  },
+  "safebooru_tags": {
+    "description": "Safebooru 标签",
+    "type": "text",
+    "hint": "多个标签请用英文分号 ; 分隔。Safebooru 标签通常使用下划线或冒号，例如：wuthering_waves;genshin_impact;honkai:_star_rail;arknights",
+    "default": "genshin_impact;honkai:_star_rail;honkai_impact;zenless_zone_zero;wuthering_waves;arknights;blue_archive;azur_lane;girls_frontline;goddess_of_victory:_nikke;punishing:_gray_raven;path_to_nowhere;reverse:1999;fate/grand_order;umamusume"
+  },
+  "safebooru_min_score": {
+    "description": "Safebooru 最低分数",
+    "type": "text",
+    "hint": "默认 5。Safebooru 没有公开点击量字段，插件使用 score 近似代表站内受欢迎程度；调高会更挑图，但可能更容易无结果。",
+    "default": "5"
+  },
+  "safebooru_excluded_tags": {
+    "description": "Safebooru 排除标签",
+    "type": "text",
+    "hint": "多个标签请用英文分号 ; 分隔。用于避开擦边、GIF、设定图、草稿或漫画页等不适合做海报背景的结果。",
+    "default": "underwear;bikini;swimsuit;lingerie;nude;naked;sex;explicit;animated_gif;character_sheet;reference_sheet;sketch;comic;manga;ass;bottomless;kiss;french_kiss;tongue;tongue_out;armpits;sports_bra;leotard;midriff;navel;nipples;pectorals;bulge;spread_legs;wide_spread_legs;feet;soles"
+  },
+  "keyword_source_timeout_seconds": {
+    "description": "关键词源请求超时秒数",
+    "type": "text",
+    "hint": "Wallhaven / Konachan / Safebooru 单次请求超时，范围 3-30 秒。云服务器到这些站点不稳定时可改为 5，让插件更快进入兜底源。",
+    "default": "8"
+  },
+  "keyword_source_retries": {
+    "description": "关键词源重试次数",
+    "type": "text",
+    "hint": "Wallhaven / Safebooru 请求失败后的重试次数，范围 0-3。Konachan 的 403 不会重试。",
+    "default": "1"
   },
   "enable_zhuqiy_fallback": {
     "description": "启用 ZHUQIY 泛二次元兜底源",
