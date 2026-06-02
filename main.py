@@ -200,11 +200,20 @@ class AnimeJrysPlugin(Star):
         self._cache_dir = self._data_dir / "cache"
         self._avatars_dir = self._data_dir / "avatars"
         self._cards_dir = self._data_dir / "cards"
+        self._base_cards_dir = self._data_dir / "base_cards"
         self._users_file = self._data_dir / "users.json"
+        self._pool_file = self._data_dir / "image_pool.json"
         self._source_cooldowns: dict[str, float] = {}
+        self._prefetch_lock = asyncio.Lock()
+        self._maintenance_lock = asyncio.Lock()
+        self._background_task: asyncio.Task | None = None
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._avatars_dir.mkdir(parents=True, exist_ok=True)
         self._cards_dir.mkdir(parents=True, exist_ok=True)
+        self._base_cards_dir.mkdir(parents=True, exist_ok=True)
+
+    async def initialize(self):
+        self._ensure_background_task()
 
     @filter.command("jrys", alias={"今日运势", "运势"})
     async def jrys(self, event: AstrMessageEvent):
@@ -223,6 +232,7 @@ class AnimeJrysPlugin(Star):
 
     async def _reply_fortune(self, event: AstrMessageEvent):
         try:
+            self._ensure_background_task()
             record = await self._get_or_create_today_record(event)
             yield event.image_result(record.card_path)
             event.stop_event()
@@ -344,6 +354,19 @@ class AnimeJrysPlugin(Star):
         return 100, "最高运势", random.choice(PERFECT_TEXTS)
 
     async def _fetch_random_image(self) -> ImageCandidate:
+        if _config_bool(self.config, "enable_image_prefetch", True):
+            pooled = await self._take_from_image_pool()
+            if pooled:
+                self._schedule_pool_refill()
+                return pooled
+
+        image = await self._fetch_random_image_live()
+        if _config_bool(self.config, "enable_image_prefetch", True):
+            await self._add_image_to_pool(image)
+            self._schedule_pool_refill()
+        return image
+
+    async def _fetch_random_image_live(self) -> ImageCandidate:
         session = await self._get_session()
         attempts = self._build_source_attempts()
 
@@ -370,6 +393,257 @@ class AnimeJrysPlugin(Star):
                 logger.info(f"图片源 {source_name} 本次不可用，继续尝试其他图源: {detail}")
 
         raise RuntimeError("所有图片源均获取失败")
+
+    async def _take_from_image_pool(self) -> ImageCandidate | None:
+        if self._image_pool_size() <= 0:
+            return None
+        entries = await asyncio.to_thread(self._load_image_pool)
+        valid_entries = [entry for entry in entries if self._pool_entry_is_valid(entry)]
+        if len(valid_entries) != len(entries):
+            await asyncio.to_thread(self._save_image_pool, valid_entries)
+        if not valid_entries:
+            return None
+        entry = random.choice(valid_entries)
+        return ImageCandidate(
+            source=str(entry.get("source", "ImagePool")),
+            url=str(entry.get("image_path", "")),
+            keyword=str(entry.get("keyword", "cached image")),
+            credit_url=str(entry.get("credit_url", "")),
+        )
+
+    async def _add_image_to_pool(self, image: ImageCandidate) -> None:
+        target = self._image_pool_size()
+        if target <= 0:
+            await asyncio.to_thread(self._save_image_pool, [])
+            return
+        if not image.url or not Path(image.url).exists():
+            return
+        async with self._prefetch_lock:
+            entries = await asyncio.to_thread(self._load_image_pool)
+            entries = [entry for entry in entries if self._pool_entry_is_valid(entry)]
+            if any(str(entry.get("image_path", "")) == image.url for entry in entries):
+                return
+            entries.append(
+                {
+                    "image_path": image.url,
+                    "source": image.source,
+                    "keyword": image.keyword,
+                    "credit_url": image.credit_url,
+                    "created_at": int(time.time()),
+                }
+            )
+            await asyncio.to_thread(self._save_image_pool, entries[-target:])
+
+    async def _ensure_image_pool(self) -> None:
+        if not _config_bool(self.config, "enable_image_prefetch", True):
+            return
+        async with self._prefetch_lock:
+            entries = await asyncio.to_thread(self._load_image_pool)
+            entries = [entry for entry in entries if self._pool_entry_is_valid(entry)]
+            target = self._image_pool_size()
+            if target <= 0:
+                await asyncio.to_thread(self._save_image_pool, [])
+                return
+            batch = self._image_pool_refill_batch()
+            missing = max(0, target - len(entries))
+            fetch_count = min(batch, missing)
+            for _ in range(fetch_count):
+                try:
+                    image = await self._fetch_random_image_live()
+                except Exception as exc:
+                    logger.info(f"图片池预取失败，稍后重试: {type(exc).__name__}: {exc}")
+                    break
+                if any(str(entry.get("image_path", "")) == image.url for entry in entries):
+                    continue
+                entries.append(
+                    {
+                        "image_path": image.url,
+                        "source": image.source,
+                        "keyword": image.keyword,
+                        "credit_url": image.credit_url,
+                        "created_at": int(time.time()),
+                    }
+                )
+                if _config_bool(self.config, "enable_shared_base_cards", True):
+                    await asyncio.to_thread(
+                        self._render_base_card,
+                        Path(image.url),
+                        self._base_card_path(Path(image.url), image.source, image.keyword),
+                        image.source,
+                        image.keyword,
+                    )
+            await asyncio.to_thread(self._save_image_pool, entries[-target:])
+
+    def _load_image_pool(self) -> list[dict[str, Any]]:
+        if not self._pool_file.exists():
+            return []
+        try:
+            data = json.loads(self._pool_file.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [entry for entry in data if isinstance(entry, dict)]
+        except Exception as exc:
+            logger.info(f"读取图片池失败，将重建: {exc}")
+        return []
+
+    def _save_image_pool(self, entries: list[dict[str, Any]]) -> None:
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self._pool_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self._pool_file)
+
+    def _pool_entry_is_valid(self, entry: dict[str, Any]) -> bool:
+        path = Path(str(entry.get("image_path", "")))
+        return path.exists() and self._is_valid_landscape_image(path)
+
+    def _image_pool_size(self) -> int:
+        return _config_int(self.config, "image_pool_size", 8, 0, 100)
+
+    def _image_pool_refill_batch(self) -> int:
+        return _config_int(self.config, "image_pool_refill_batch", 2, 1, 20)
+
+    def _schedule_pool_refill(self) -> None:
+        if not _config_bool(self.config, "enable_image_prefetch", True):
+            return
+        if self._image_pool_size() <= 0:
+            return
+        try:
+            asyncio.create_task(self._ensure_image_pool())
+        except RuntimeError:
+            return
+
+    def _ensure_background_task(self) -> None:
+        if self._background_task and not self._background_task.done():
+            return
+        try:
+            self._background_task = asyncio.create_task(self._background_loop())
+        except RuntimeError:
+            return
+
+    async def _background_loop(self) -> None:
+        while True:
+            try:
+                await self._run_maintenance()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.info(f"缓存维护任务失败，稍后重试: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(60, self._cleanup_interval_hours() * 3600))
+
+    async def _run_maintenance(self) -> None:
+        async with self._maintenance_lock:
+            await asyncio.to_thread(self._cleanup_cache_files)
+            await self._ensure_image_pool()
+
+    def _cleanup_interval_hours(self) -> int:
+        return _config_int(self.config, "cleanup_interval_hours", 12, 1, 168)
+
+    def _cleanup_cache_files(self) -> None:
+        users = self._load_users()
+        protected = self._protected_cache_paths(users)
+        now = time.time()
+        self._delete_old_files(
+            self._cards_dir,
+            _config_int(self.config, "card_retention_days", 7, 1, 3650),
+            now,
+            protected,
+        )
+        self._delete_old_files(
+            self._base_cards_dir,
+            _config_int(self.config, "base_card_retention_days", 7, 1, 3650),
+            now,
+            protected,
+        )
+        self._delete_old_files(
+            self._cache_dir,
+            _config_int(self.config, "image_cache_retention_days", 14, 1, 3650),
+            now,
+            protected,
+        )
+        avatar_days = _config_int(self.config, "avatar_cache_days", 5, -1, 3650)
+        if avatar_days >= 0:
+            self._delete_old_files(self._avatars_dir, max(1, avatar_days), now, protected)
+
+        self._trim_cache_size(protected)
+        pool = [entry for entry in self._load_image_pool() if self._pool_entry_is_valid(entry)]
+        pool_size = self._image_pool_size()
+        self._save_image_pool(pool[-pool_size:] if pool_size > 0 else [])
+
+    def _protected_cache_paths(self, users: dict[str, Any]) -> set[Path]:
+        protected: set[Path] = {self._users_file, self._pool_file}
+        today = _today_str()
+        for value in users.values():
+            if not isinstance(value, dict):
+                continue
+            if str(value.get("day", "")) != today:
+                continue
+            for key in ("card_path", "image_path", "avatar_path"):
+                path_text = str(value.get(key, "") or "")
+                if path_text:
+                    protected.add(self._normalize_path(Path(path_text)))
+        for entry in self._load_image_pool():
+            path_text = str(entry.get("image_path", "") or "")
+            if path_text:
+                protected.add(self._normalize_path(Path(path_text)))
+        return protected
+
+    def _delete_old_files(
+        self,
+        directory: Path,
+        retention_days: int,
+        now: float,
+        protected: set[Path],
+    ) -> None:
+        if not directory.exists():
+            return
+        cutoff = now - retention_days * 86400
+        for path in directory.rglob("*"):
+            if not path.is_file():
+                continue
+            if self._normalize_path(path) in protected:
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def _trim_cache_size(self, protected: set[Path]) -> None:
+        max_mb = _config_int(self.config, "cache_max_mb", 300, 0, 10240)
+        if max_mb <= 0:
+            return
+        max_bytes = max_mb * 1024 * 1024
+        files: list[tuple[float, int, Path]] = []
+        total = 0
+        for directory in (self._cache_dir, self._avatars_dir, self._cards_dir, self._base_cards_dir):
+            if not directory.exists():
+                continue
+            for path in directory.rglob("*"):
+                if not path.is_file():
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                total += stat.st_size
+                if self._normalize_path(path) not in protected:
+                    files.append((stat.st_mtime, stat.st_size, path))
+        if total <= max_bytes:
+            return
+        files.sort(key=lambda item: item[0])
+        for _mtime, size, path in files:
+            if total <= max_bytes:
+                break
+            try:
+                path.unlink(missing_ok=True)
+                total -= size
+            except OSError:
+                continue
+
+    def _normalize_path(self, path: Path) -> Path:
+        try:
+            return path.resolve()
+        except OSError:
+            return path.absolute()
 
     def _build_source_attempts(self) -> list[tuple[str, str]]:
         enable_wallhaven = _config_bool(self.config, "enable_wallhaven_source", True)
@@ -769,7 +1043,11 @@ class AnimeJrysPlugin(Star):
             return ""
         cache_key = _sha256_text(user.avatar_url)
         dest = self._avatars_dir / f"{cache_key}.jpg"
-        if dest.exists() and await asyncio.to_thread(self._is_valid_avatar_image, dest):
+        if (
+            dest.exists()
+            and not self._avatar_cache_expired(dest)
+            and await asyncio.to_thread(self._is_valid_avatar_image, dest)
+        ):
             return str(dest)
 
         session = await self._get_session()
@@ -803,6 +1081,18 @@ class AnimeJrysPlugin(Star):
         except Exception:
             return False
 
+    def _avatar_cache_expired(self, path: Path) -> bool:
+        days = _config_int(self.config, "avatar_cache_days", 5, -1, 3650)
+        if days < 0:
+            return False
+        if days == 0:
+            return True
+        try:
+            age_seconds = time.time() - path.stat().st_mtime
+        except OSError:
+            return True
+        return age_seconds > days * 86400
+
     def _render_card(
         self,
         image_path: Path,
@@ -816,29 +1106,20 @@ class AnimeJrysPlugin(Star):
         display_name: str = "",
         avatar_path: str = "",
     ) -> None:
-        bg = Image.new("RGB", CANVAS_SIZE, (246, 242, 236))
-        with Image.open(image_path) as raw:
-            hero = ImageOps.exif_transpose(raw).convert("RGB")
-        hero = ImageOps.fit(hero, (CANVAS_SIZE[0], IMAGE_AREA_HEIGHT), Image.Resampling.LANCZOS)
-        bg.paste(hero, (0, 0))
+        if _config_bool(self.config, "enable_shared_base_cards", True):
+            base_path = self._base_card_path(image_path, image_source, image_keyword)
+            if not base_path.exists():
+                self._render_base_card(image_path, base_path, image_source, image_keyword)
+            with Image.open(base_path) as raw_base:
+                bg = raw_base.convert("RGBA")
+        else:
+            bg = self._create_base_card_image(image_path, image_source, image_keyword)
 
-        overlay = Image.new("RGBA", CANVAS_SIZE, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        panel_top = 800
-        draw.rounded_rectangle(
-            (42, panel_top, 1038, 1392),
-            radius=34,
-            fill=(255, 253, 248, 238),
-            outline=(255, 255, 255, 180),
-            width=2,
-        )
-        bg = Image.alpha_composite(bg.convert("RGBA"), overlay)
         draw = ImageDraw.Draw(bg)
 
         font_large = self._font(160, bold=True)
         font_body = self._font(38)
         font_small = self._font(28)
-        font_tiny = self._font(22)
 
         accent = self._accent_for_score(score)
         draw.text((86, 838), str(score), font=font_large, fill=accent)
@@ -862,14 +1143,85 @@ class AnimeJrysPlugin(Star):
         if _config_bool(self.config, "show_user_badge", True):
             self._draw_user_badge(bg, draw, display_name, avatar_path)
 
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._save_card_image(bg, output_path)
+
+    def _render_base_card(
+        self,
+        image_path: Path,
+        output_path: Path,
+        image_source: str,
+        image_keyword: str,
+    ) -> None:
+        base = self._create_base_card_image(image_path, image_source, image_keyword)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        base.save(output_path, "PNG")
+
+    def _create_base_card_image(
+        self,
+        image_path: Path,
+        image_source: str,
+        image_keyword: str,
+    ) -> Image.Image:
+        bg = Image.new("RGB", CANVAS_SIZE, (246, 242, 236))
+        with Image.open(image_path) as raw:
+            hero = ImageOps.exif_transpose(raw).convert("RGB")
+        hero = ImageOps.fit(hero, (CANVAS_SIZE[0], IMAGE_AREA_HEIGHT), Image.Resampling.LANCZOS)
+        bg.paste(hero, (0, 0))
+
+        overlay = Image.new("RGBA", CANVAS_SIZE, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        panel_top = 800
+        draw.rounded_rectangle(
+            (42, panel_top, 1038, 1392),
+            radius=34,
+            fill=(255, 253, 248, 238),
+            outline=(255, 255, 255, 180),
+            width=2,
+        )
+        bg = Image.alpha_composite(bg.convert("RGBA"), overlay)
+        draw = ImageDraw.Draw(bg)
+
+        font_tiny = self._font(22)
+
         if _config_bool(self.config, "show_image_source_notice", True):
             source_text = f"Image source: {image_source}"
             if image_keyword:
                 source_text += f" / {image_keyword}"
             draw.text((76, 1360), source_text[:86], font=font_tiny, fill=(124, 116, 108))
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        bg.convert("RGB").save(output_path, "JPEG", quality=92, optimize=True)
+        return bg
+
+    def _base_card_path(self, image_path: Path, image_source: str, image_keyword: str) -> Path:
+        try:
+            stat = image_path.stat()
+            image_sig = f"{image_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
+        except OSError:
+            image_sig = str(image_path)
+        key = _sha256_text(
+            "|".join(
+                [
+                    image_sig,
+                    image_source,
+                    image_keyword,
+                    str(_config_bool(self.config, "show_image_source_notice", True)),
+                    "base-card-v2",
+                ]
+            )
+        )
+        return self._base_cards_dir / f"{key}.png"
+
+    def _save_card_image(self, image: Image.Image, output_path: Path) -> None:
+        output_width = _config_int(self.config, "output_width", 1080, 720, 1440)
+        output_height = _config_int(self.config, "output_height", 1440, 960, 1920)
+        if image.size != (output_width, output_height):
+            image = image.resize((output_width, output_height), Image.Resampling.LANCZOS)
+        image.convert("RGB").save(
+            output_path,
+            "JPEG",
+            quality=_config_int(self.config, "jpeg_quality", 88, 60, 95),
+            optimize=_config_bool(self.config, "jpeg_optimize", False),
+        )
 
     def _draw_user_badge(
         self,
@@ -1116,6 +1468,12 @@ class AnimeJrysPlugin(Star):
         tmp.replace(self._users_file)
 
     async def terminate(self):
+        if self._background_task and not self._background_task.done():
+            self._background_task.cancel()
+            try:
+                await self._background_task
+            except asyncio.CancelledError:
+                pass
         if self._session and not self._session.closed:
             await self._session.close()
 

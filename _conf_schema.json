@@ -83,6 +83,90 @@
     "hint": "默认开启。群聊中可用于区分是谁触发了今日运势；QQ 平台会优先使用群名片/昵称，并尝试拉取 QQ 头像。",
     "default": true
   },
+  "enable_image_prefetch": {
+    "description": "启用图片预取池",
+    "type": "bool",
+    "hint": "默认开启。插件会在后台提前下载并校验若干张可用图片，用户触发时优先从本地图片池取图，减少等待。",
+    "default": true
+  },
+  "image_pool_size": {
+    "description": "图片预取池容量",
+    "type": "text",
+    "hint": "默认 8，范围 0-100。设为 0 可关闭图片池；数值越大，突发多人触发时越快，但会占用更多缓存空间。",
+    "default": "8"
+  },
+  "image_pool_refill_batch": {
+    "description": "每次预取补图数量",
+    "type": "text",
+    "hint": "默认 2，范围 1-20。后台维护时最多补充多少张图片。服务器网络较慢时建议保持较小。",
+    "default": "2"
+  },
+  "enable_shared_base_cards": {
+    "description": "启用多用户共享预渲染底图",
+    "type": "bool",
+    "hint": "默认开启。相同背景图会先生成一张不含分数、文案、头像的底图，多个用户共用它，再分别叠加自己的运势和昵称。",
+    "default": true
+  },
+  "cleanup_interval_hours": {
+    "description": "缓存清理间隔小时数",
+    "type": "text",
+    "hint": "默认 12，范围 1-168。插件运行期间会定时清理旧图片、旧海报和旧头像；用户连续测运天数保存在 users.json，不会被清理。",
+    "default": "12"
+  },
+  "cache_max_mb": {
+    "description": "缓存大小上限 MB",
+    "type": "text",
+    "hint": "默认 300，范围 0-10240。超过上限后会优先删除较旧的缓存文件；设为 0 表示不按总大小裁剪。",
+    "default": "300"
+  },
+  "image_cache_retention_days": {
+    "description": "原始图片缓存保留天数",
+    "type": "text",
+    "hint": "默认 14，范围 1-3650。只影响下载的第三方图片缓存，不影响用户连续测运记录。",
+    "default": "14"
+  },
+  "card_retention_days": {
+    "description": "最终海报缓存保留天数",
+    "type": "text",
+    "hint": "默认 7，范围 1-3650。今天的用户海报会受到保护；过期旧海报可自动清理。",
+    "default": "7"
+  },
+  "base_card_retention_days": {
+    "description": "共享底图缓存保留天数",
+    "type": "text",
+    "hint": "默认 7，范围 1-3650。共享底图只包含背景图、面板和图片来源，不含用户个人信息。",
+    "default": "7"
+  },
+  "avatar_cache_days": {
+    "description": "头像缓存过期天数",
+    "type": "text",
+    "hint": "默认 5，范围 -1 到 3650。设为 5 表示头像最多缓存 5 天；设为 0 表示每次都重新拉取；设为 -1 表示不过期。",
+    "default": "5"
+  },
+  "output_width": {
+    "description": "输出图片宽度",
+    "type": "text",
+    "hint": "默认 1080，范围 720-1440。调小会减少文件体积、提升发送速度；调大更清晰但更慢。",
+    "default": "1080"
+  },
+  "output_height": {
+    "description": "输出图片高度",
+    "type": "text",
+    "hint": "默认 1440，范围 960-1920。建议保持 3:4 左右比例，例如 1080x1440 或 900x1200。",
+    "default": "1440"
+  },
+  "jpeg_quality": {
+    "description": "JPEG 输出质量",
+    "type": "text",
+    "hint": "默认 88，范围 60-95。数值越低文件越小、发送越快；数值越高画质更好但文件更大。",
+    "default": "88"
+  },
+  "jpeg_optimize": {
+    "description": "启用 JPEG 优化压缩",
+    "type": "bool",
+    "hint": "默认关闭。开启后文件通常更小，但保存图片会多花一点 CPU 时间；更适合画质优先或带宽较慢的服务器。",
+    "default": false
+  },
   "font_path": {
     "description": "自定义字体路径",
     "type": "string",

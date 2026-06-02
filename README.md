@@ -134,6 +134,31 @@ Wallhaven 请求失败后的重试次数，默认 `1`，范围 `0-3`。Konachan 
 - `show_user_badge`: 是否在海报左下角显示触发用户的头像和昵称，默认开启。
 - `font_path`: 自定义中文字体路径。插件已内置中文子集字体，一般无需配置。
 
+## 缓存与性能
+
+插件会把连续测运天数保存在 `users.json`，缓存清理不会删除这个文件，所以自动清理旧图片、旧海报或旧头像不会影响用户连续签到天数。
+
+可配置项：
+
+- `enable_image_prefetch`: 是否启用图片预取池，默认开启。开启后插件会在后台提前下载并校验图片，用户触发时优先使用本地图片池。
+- `image_pool_size`: 图片池容量，默认 `8`。设为 `0` 可关闭图片池；数值越大，突发多人触发时越容易快速出图，但占用缓存更多。
+- `image_pool_refill_batch`: 每次后台补图数量，默认 `2`。服务器网络慢时建议保持较小。
+- `enable_shared_base_cards`: 是否启用多用户共享预渲染底图，默认开启。共享底图不包含用户头像、昵称、分数和文案，只复用背景图、面板和来源标注。
+- `cleanup_interval_hours`: 缓存维护间隔，默认 `12` 小时。
+- `cache_max_mb`: 缓存总大小上限，默认 `300` MB。超过上限时会优先删除旧缓存；设为 `0` 表示不按大小裁剪。
+- `image_cache_retention_days`: 原始图片缓存保留天数，默认 `14` 天。
+- `card_retention_days`: 最终海报缓存保留天数，默认 `7` 天。
+- `base_card_retention_days`: 共享底图缓存保留天数，默认 `7` 天。
+- `avatar_cache_days`: 头像缓存过期天数，默认 `5` 天。设为 `0` 表示每次重新拉取头像；设为 `-1` 表示不过期。
+- `output_width` / `output_height`: 输出图片尺寸，默认 `1080x1440`。调小可以减少文件体积、提升发送速度。
+- `jpeg_quality`: JPEG 输出质量，默认 `88`，范围 `60-95`。更低更快更小，更高更清晰。
+- `jpeg_optimize`: 是否启用 JPEG 优化压缩，默认关闭。开启后文件通常更小，但保存图片会多耗一点 CPU。
+
+推荐配置：
+
+- 速度优先：`output_width=900`、`output_height=1200`、`jpeg_quality=82`、`jpeg_optimize=false`、`image_pool_size=12`
+- 画质优先：`output_width=1080`、`output_height=1440`、`jpeg_quality=90`、`jpeg_optimize=true`、`image_pool_size=8`
+
 ## QQ 用户信息
 
 插件会优先使用 AstrBot 事件中的发送者昵称；在 QQ 群聊中，如果原始事件里包含群名片 `card`，会优先使用群名片。头像会优先读取事件里的头像字段，若没有，则使用 QQ 号构造公开头像地址：
