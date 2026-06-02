@@ -52,7 +52,7 @@ Konachan 标签。多个标签使用英文分号 `;` 分隔。
 wuthering_waves;genshin_impact;arknights
 ```
 
-默认内置标签：
+Konachan 在部分云服务器上可能返回 `403 Forbidden`。因此插件默认不启用 Konachan；如果你的服务器可正常访问，可以手动填写标签：
 
 ```text
 genshin_impact;honkai:_star_rail;honkai_impact;zenless_zone_zero;wuthering_waves;arknights;blue_archive;azur_lane;girls_frontline;goddess_of_victory:_nikke;punishing:_gray_raven;snowbreak:_containment_zone;path_to_nowhere;reverse:1999;fate/grand_order
@@ -65,7 +65,24 @@ genshin_impact;honkai:_star_rail;honkai_impact;zenless_zone_zero;wuthering_waves
 - `enable_zhuqiy_fallback`: 关键词源失败后是否启用 ZHUQIY 兜底。
 - `enable_waifu_im_fallback`: 关键词源和 ZHUQIY 失败后是否启用 Waifu.im 兜底。
 - `show_image_source_notice`: 是否在海报底部显示图片来源。
-- `font_path`: 自定义中文字体路径。Docker/Linux 中文乱码时建议配置。
+- `font_path`: 自定义中文字体路径。插件已内置中文子集字体，一般无需配置。
+
+## 字体
+
+插件内置 `assets/fonts/NotoSansSC-JrysSubset.ttf`，这是 Noto Sans SC 的插件专用子集字体，只包含运势海报需要的字符。它来自 Noto Sans CJK / Noto Sans SC，使用 SIL Open Font License 1.1 授权，许可证见 `assets/fonts/OFL.txt`。
+
+因此 Docker / Linux 用户默认不需要额外安装中文字体。如果你想替换成自己的字体，可以在插件配置中填写：
+
+
+```text
+/usr/share/fonts
+```
+
+或具体字体文件：
+
+```text
+/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+```
 
 ## 运势概率
 
@@ -100,5 +117,3 @@ AstrBot/data/plugins/astrbot_plugin_anime_jrys
 - Wallhaven 使用 `purity=100`
 - Konachan 使用 `rating:safe`
 - Waifu.im 使用 `IsNsfw=False`
-
-

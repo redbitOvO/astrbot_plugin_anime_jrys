@@ -6,6 +6,7 @@ import json
 import os
 import random
 import textwrap
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -65,12 +66,7 @@ DEFAULT_WALLHAVEN_KEYWORDS = (
     "punishing gray raven;snowbreak containment zone;path to nowhere;reverse 1999;"
     "fate grand order;umamusume"
 )
-DEFAULT_KONACHAN_TAGS = (
-    "genshin_impact;honkai:_star_rail;honkai_impact;zenless_zone_zero;"
-    "wuthering_waves;arknights;blue_archive;azur_lane;girls_frontline;"
-    "goddess_of_victory:_nikke;punishing:_gray_raven;snowbreak:_containment_zone;"
-    "path_to_nowhere;reverse:1999;fate/grand_order"
-)
+DEFAULT_KONACHAN_TAGS = ""
 
 TRIGGER_WORDS = {"jrys", "今日运势", "运势"}
 HTTP_HEADERS = {
@@ -153,6 +149,7 @@ class AnimeJrysPlugin(Star):
         self._cache_dir = self._data_dir / "cache"
         self._cards_dir = self._data_dir / "cards"
         self._users_file = self._data_dir / "users.json"
+        self._source_cooldowns: dict[str, float] = {}
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._cards_dir.mkdir(parents=True, exist_ok=True)
 
@@ -263,6 +260,8 @@ class AnimeJrysPlugin(Star):
         attempts = self._build_source_attempts()
 
         for source_name, keyword in attempts:
+            if self._is_source_in_cooldown(source_name):
+                continue
             try:
                 candidate = await self._resolve_candidate(session, source_name, keyword)
                 if not candidate:
@@ -276,7 +275,11 @@ class AnimeJrysPlugin(Star):
                         credit_url=candidate.credit_url,
                     )
             except Exception as exc:
-                logger.warning(f"图片源 {source_name} 获取失败: {exc}")
+                status = self._status_from_exception(exc)
+                if status in {403, 429}:
+                    self._cooldown_source(source_name, status)
+                detail = f"{type(exc).__name__}: {exc}".strip()
+                logger.warning(f"图片源 {source_name} 获取失败: {detail}")
 
         raise RuntimeError("所有图片源均获取失败")
 
@@ -298,7 +301,7 @@ class AnimeJrysPlugin(Star):
 
         if keyword_sources:
             for name, values in keyword_sources:
-                sample = random.sample(values, k=min(len(values), 4))
+                sample = random.sample(values, k=min(len(values), 2))
                 keyword_attempts.extend((name, value) for value in sample)
 
         if bool(_config_get(self.config, "enable_zhuqiy_fallback", True)):
@@ -309,6 +312,27 @@ class AnimeJrysPlugin(Star):
         random.shuffle(keyword_attempts)
         random.shuffle(fallback_attempts)
         return keyword_attempts + fallback_attempts
+
+    def _is_source_in_cooldown(self, source_name: str) -> bool:
+        until = self._source_cooldowns.get(source_name, 0)
+        if until <= time.time():
+            if source_name in self._source_cooldowns:
+                self._source_cooldowns.pop(source_name, None)
+            return False
+        return True
+
+    def _cooldown_source(self, source_name: str, status: int) -> None:
+        seconds = 3600 if status == 403 else 600
+        self._source_cooldowns[source_name] = time.time() + seconds
+        logger.warning(
+            f"图片源 {source_name} 返回 HTTP {status}，已临时跳过 {seconds // 60} 分钟"
+        )
+
+    def _status_from_exception(self, exc: Exception) -> int | None:
+        status = getattr(exc, "status", None)
+        if isinstance(status, int):
+            return status
+        return None
 
     async def _resolve_candidate(
         self,
@@ -538,10 +562,25 @@ class AnimeJrysPlugin(Star):
         return lines
 
     def _font(self, size: int, bold: bool = False) -> ImageFont.ImageFont:
+        cache_key = (size, bold)
+        font_cache = getattr(self, "_font_cache", None)
+        if font_cache is None:
+            font_cache = {}
+            setattr(self, "_font_cache", font_cache)
+        if cache_key in font_cache:
+            return font_cache[cache_key]
+
         configured = str(_config_get(self.config, "font_path", "") or "").strip()
-        candidates = []
+        candidates: list[str] = []
         if configured:
             candidates.append(configured)
+        bundled_font = (
+            Path(__file__).resolve().parent
+            / "assets"
+            / "fonts"
+            / "NotoSansSC-JrysSubset.ttf"
+        )
+        candidates.append(str(bundled_font))
         if os.name == "nt":
             candidates.extend(
                 [
@@ -555,17 +594,83 @@ class AnimeJrysPlugin(Star):
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
                 if bold
                 else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Bold.otf"
+                if bold
+                else "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+                "/usr/share/fonts/truetype/noto/NotoSansSC-Bold.ttf"
+                if bold
+                else "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.ttf",
                 "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+                "/usr/share/fonts/truetype/arphic/uming.ttc",
+                "/usr/share/fonts/truetype/arphic/ukai.ttc",
+                "/usr/share/fonts",
+                "/usr/local/share/fonts",
                 "/System/Library/Fonts/PingFang.ttc",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+                if bold
+                else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             ]
         )
         for path in candidates:
             try:
-                if path and Path(path).exists():
-                    return ImageFont.truetype(path, size=size)
+                font_file = self._resolve_font_file(path, bold)
+                if font_file:
+                    font = ImageFont.truetype(font_file, size=size)
+                    self._apply_font_weight(font, bold)
+                    font_cache[cache_key] = font
+                    return font
+            except Exception as exc:
+                logger.warning(f"加载字体失败: {path} | {exc}")
+                continue
+
+        logger.warning(
+            "未找到可用 TrueType/OpenType 字体，海报文字可能过小或无法显示中文。"
+            "请安装 fonts-noto-cjk 或在插件配置 font_path 中填写中文字体路径。"
+        )
+        font = ImageFont.load_default(size=max(10, min(size, 64)))
+        font_cache[cache_key] = font
+        return font
+
+    def _resolve_font_file(self, path: str, bold: bool = False) -> str:
+        if not path:
+            return ""
+        target = Path(path)
+        if target.is_file():
+            return str(target)
+        if not target.is_dir():
+            return ""
+
+        preferred = [
+            "NotoSansCJK-Bold.ttc" if bold else "NotoSansCJK-Regular.ttc",
+            "NotoSansCJKsc-Bold.otf" if bold else "NotoSansCJKsc-Regular.otf",
+            "NotoSansSC-Bold.ttf" if bold else "NotoSansSC-Regular.ttf",
+            "SourceHanSansSC-Bold.otf" if bold else "SourceHanSansSC-Regular.otf",
+            "SourceHanSansCN-Bold.otf" if bold else "SourceHanSansCN-Regular.otf",
+            "wqy-microhei.ttc",
+            "wqy-zenhei.ttc",
+            "simhei.ttf",
+            "msyh.ttc",
+            "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+        ]
+        for name in preferred:
+            try:
+                matches = list(target.rglob(name))
+                if matches:
+                    return str(matches[0])
             except Exception:
                 continue
-        return ImageFont.load_default()
+        return ""
+
+    def _apply_font_weight(self, font: ImageFont.ImageFont, bold: bool) -> None:
+        setter = getattr(font, "set_variation_by_axes", None)
+        if not callable(setter):
+            return
+        try:
+            setter([700 if bold else 400])
+        except Exception:
+            return
 
     def _accent_for_score(self, score: int) -> tuple[int, int, int]:
         if score < 25:
@@ -582,7 +687,7 @@ class AnimeJrysPlugin(Star):
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=12)
+            timeout = aiohttp.ClientTimeout(total=20)
             connector = aiohttp.TCPConnector(limit=8)
             self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
