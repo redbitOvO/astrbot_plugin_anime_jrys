@@ -97,6 +97,13 @@ class ImageCandidate:
     credit_url: str = ""
 
 
+@dataclass(frozen=True)
+class UserDisplay:
+    user_id: str
+    name: str
+    avatar_url: str = ""
+
+
 @dataclass
 class FortuneRecord:
     day: str
@@ -108,6 +115,9 @@ class FortuneRecord:
     image_source: str
     image_keyword: str
     card_path: str
+    display_name: str = ""
+    avatar_url: str = ""
+    avatar_path: str = ""
 
 
 def _config_get(config: Any, key: str, default: Any) -> Any:
@@ -157,7 +167,7 @@ def _today_str() -> str:
     return date.today().isoformat()
 
 
-def _safe_user_id(event: AstrMessageEvent) -> str:
+def _raw_user_id(event: AstrMessageEvent) -> str:
     try:
         user_id = str(event.get_sender_id())
     except Exception:
@@ -167,6 +177,11 @@ def _safe_user_id(event: AstrMessageEvent) -> str:
             user_id = str(event.message_obj.sender.user_id)
         except Exception:
             user_id = "unknown"
+    return user_id
+
+
+def _safe_user_id(event: AstrMessageEvent) -> str:
+    user_id = _raw_user_id(event)
     digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16]
     return digest
 
@@ -183,10 +198,12 @@ class AnimeJrysPlugin(Star):
         self._lock = asyncio.Lock()
         self._data_dir = self._get_plugin_data_dir()
         self._cache_dir = self._data_dir / "cache"
+        self._avatars_dir = self._data_dir / "avatars"
         self._cards_dir = self._data_dir / "cards"
         self._users_file = self._data_dir / "users.json"
         self._source_cooldowns: dict[str, float] = {}
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._avatars_dir.mkdir(parents=True, exist_ok=True)
         self._cards_dir.mkdir(parents=True, exist_ok=True)
 
     @filter.command("jrys", alias={"今日运势", "运势"})
@@ -217,17 +234,42 @@ class AnimeJrysPlugin(Star):
     async def _get_or_create_today_record(self, event: AstrMessageEvent) -> FortuneRecord:
         user_key = _safe_user_id(event)
         today = _today_str()
+        user_display = self._get_user_display(event)
         async with self._lock:
             users = await asyncio.to_thread(self._load_users)
             existing = users.get(user_key, {})
             if existing.get("day") == today and existing.get("card_path"):
                 card_path = Path(existing["card_path"])
-                if card_path.exists():
+                if card_path.exists() and self._record_has_display_badge(existing):
                     return FortuneRecord(**existing)
+                if card_path.exists() and existing.get("image_path"):
+                    image_path = Path(str(existing["image_path"]))
+                    if image_path.exists():
+                        avatar_path = await self._fetch_user_avatar(user_display)
+                        await asyncio.to_thread(
+                            self._render_card,
+                            image_path,
+                            card_path,
+                            int(existing.get("score", 0) or 0),
+                            str(existing.get("tier", "")),
+                            str(existing.get("text", "")),
+                            int(existing.get("streak", 1) or 1),
+                            str(existing.get("image_source", "")),
+                            str(existing.get("image_keyword", "")),
+                            user_display.name,
+                            avatar_path,
+                        )
+                        existing["display_name"] = user_display.name
+                        existing["avatar_url"] = user_display.avatar_url
+                        existing["avatar_path"] = avatar_path
+                        users[user_key] = existing
+                        await asyncio.to_thread(self._save_users, users)
+                        return FortuneRecord(**existing)
 
             streak = self._next_streak(existing, today)
             score, tier, text = self._roll_fortune()
             image = await self._fetch_random_image()
+            avatar_path = await self._fetch_user_avatar(user_display)
             card_path = self._cards_dir / f"{today}_{user_key}.jpg"
             await asyncio.to_thread(
                 self._render_card,
@@ -239,6 +281,8 @@ class AnimeJrysPlugin(Star):
                 streak,
                 image.source,
                 image.keyword,
+                user_display.name,
+                avatar_path,
             )
 
             record = FortuneRecord(
@@ -251,10 +295,18 @@ class AnimeJrysPlugin(Star):
                 image_source=image.source,
                 image_keyword=image.keyword,
                 card_path=str(card_path),
+                display_name=user_display.name,
+                avatar_url=user_display.avatar_url,
+                avatar_path=avatar_path,
             )
             users[user_key] = record.__dict__
             await asyncio.to_thread(self._save_users, users)
             return record
+
+    def _record_has_display_badge(self, record: dict[str, Any]) -> bool:
+        if not _config_bool(self.config, "show_user_badge", True):
+            return True
+        return bool(str(record.get("display_name", "")).strip())
 
     def _next_streak(self, existing: dict[str, Any], today: str) -> int:
         previous_day = str(existing.get("day", ""))
@@ -637,6 +689,120 @@ class AnimeJrysPlugin(Star):
             return ".jpg"
         return ""
 
+    def _get_user_display(self, event: AstrMessageEvent) -> UserDisplay:
+        user_id = _raw_user_id(event)
+        name = self._first_non_empty(
+            self._raw_sender_value(event, "card"),
+            self._raw_sender_value(event, "nickname"),
+            self._call_event_getter(event, "get_sender_name"),
+            self._message_sender_value(event, "nickname"),
+            user_id,
+        )
+        avatar_url = self._first_non_empty(
+            self._raw_sender_value(event, "avatar"),
+            self._raw_sender_value(event, "avatar_url"),
+            self._raw_sender_value(event, "face"),
+        )
+        if not avatar_url and user_id.isdigit():
+            avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=100"
+        return UserDisplay(
+            user_id=user_id,
+            name=self._clean_display_name(name, user_id),
+            avatar_url=avatar_url,
+        )
+
+    def _call_event_getter(self, event: AstrMessageEvent, name: str) -> str:
+        getter = getattr(event, name, None)
+        if not callable(getter):
+            return ""
+        try:
+            return str(getter() or "")
+        except Exception:
+            return ""
+
+    def _raw_sender_value(self, event: AstrMessageEvent, key: str) -> str:
+        try:
+            raw = getattr(event.message_obj, "raw_message", None)
+        except Exception:
+            raw = None
+        sender = self._item_from_mapping_or_object(raw, "sender")
+        return self._value_from_mapping_or_object(sender, key)
+
+    def _message_sender_value(self, event: AstrMessageEvent, key: str) -> str:
+        try:
+            sender = getattr(event.message_obj, "sender", None)
+        except Exception:
+            sender = None
+        return self._value_from_mapping_or_object(sender, key)
+
+    def _value_from_mapping_or_object(self, obj: Any, key: str) -> str:
+        value = self._item_from_mapping_or_object(obj, key)
+        if value is None:
+            return ""
+        return str(value)
+
+    def _item_from_mapping_or_object(self, obj: Any, key: str) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    def _first_non_empty(self, *values: str) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _clean_display_name(self, name: str, user_id: str) -> str:
+        cleaned = "".join(ch for ch in str(name or "").strip() if ch.isprintable())
+        cleaned = " ".join(cleaned.split())
+        if not cleaned:
+            cleaned = f"QQ {user_id[-4:]}" if user_id and user_id != "unknown" else "今日测运者"
+        return cleaned[:32]
+
+    async def _fetch_user_avatar(self, user: UserDisplay) -> str:
+        if not _config_bool(self.config, "show_user_badge", True):
+            return ""
+        if not user.avatar_url:
+            return ""
+        cache_key = _sha256_text(user.avatar_url)
+        dest = self._avatars_dir / f"{cache_key}.jpg"
+        if dest.exists() and await asyncio.to_thread(self._is_valid_avatar_image, dest):
+            return str(dest)
+
+        session = await self._get_session()
+        tmp = self._avatars_dir / f"{cache_key}.tmp"
+        try:
+            timeout = aiohttp.ClientTimeout(total=8)
+            async with session.get(user.avatar_url, headers=HTTP_HEADERS, timeout=timeout) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("Content-Type", "")
+                data = await resp.read()
+                if "image" not in content_type.lower() and not data.startswith(
+                    (b"\xff\xd8", b"\x89PNG", b"RIFF")
+                ):
+                    return ""
+            await asyncio.to_thread(tmp.write_bytes, data)
+            if not await asyncio.to_thread(self._is_valid_avatar_image, tmp):
+                return ""
+            tmp.replace(dest)
+            return str(dest)
+        except Exception as exc:
+            logger.info(f"QQ 头像获取失败，将使用占位头像: {user.user_id} | {exc}")
+            return ""
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _is_valid_avatar_image(self, path: Path) -> bool:
+        try:
+            with Image.open(path) as img:
+                width, height = img.size
+                return width >= 16 and height >= 16
+        except Exception:
+            return False
+
     def _render_card(
         self,
         image_path: Path,
@@ -647,6 +813,8 @@ class AnimeJrysPlugin(Star):
         streak: int,
         image_source: str,
         image_keyword: str,
+        display_name: str = "",
+        avatar_path: str = "",
     ) -> None:
         bg = Image.new("RGB", CANVAS_SIZE, (246, 242, 236))
         with Image.open(image_path) as raw:
@@ -691,6 +859,9 @@ class AnimeJrysPlugin(Star):
             fill=(80, 74, 68),
         )
 
+        if _config_bool(self.config, "show_user_badge", True):
+            self._draw_user_badge(bg, draw, display_name, avatar_path)
+
         if _config_bool(self.config, "show_image_source_notice", True):
             source_text = f"Image source: {image_source}"
             if image_keyword:
@@ -699,6 +870,53 @@ class AnimeJrysPlugin(Star):
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         bg.convert("RGB").save(output_path, "JPEG", quality=92, optimize=True)
+
+    def _draw_user_badge(
+        self,
+        canvas: Image.Image,
+        draw: ImageDraw.ImageDraw,
+        display_name: str,
+        avatar_path: str,
+    ) -> None:
+        x, y, size = 76, 1284, 58
+        name = self._ellipsize_text(display_name or "今日测运者", self._font(28), 360)
+
+        shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        shadow_draw = ImageDraw.Draw(shadow)
+        shadow_draw.ellipse((x - 2, y + 2, x + size + 2, y + size + 6), fill=(0, 0, 0, 34))
+        canvas.alpha_composite(shadow)
+
+        avatar_drawn = False
+        if avatar_path:
+            try:
+                with Image.open(avatar_path) as raw:
+                    avatar = ImageOps.exif_transpose(raw).convert("RGBA")
+                avatar = ImageOps.fit(avatar, (size, size), Image.Resampling.LANCZOS)
+                mask = Image.new("L", (size, size), 0)
+                mask_draw = ImageDraw.Draw(mask)
+                mask_draw.ellipse((0, 0, size, size), fill=255)
+                canvas.paste(avatar, (x, y), mask)
+                avatar_drawn = True
+            except Exception as exc:
+                logger.info(f"头像绘制失败，将使用占位头像: {avatar_path} | {exc}")
+
+        if not avatar_drawn:
+            draw.ellipse((x, y, x + size, y + size), fill=(229, 218, 204))
+            initial = (name[:1] or "运").upper()
+            initial_font = self._font(28, bold=True)
+            initial_bbox = draw.textbbox((0, 0), initial, font=initial_font)
+            draw.text(
+                (
+                    x + (size - (initial_bbox[2] - initial_bbox[0])) / 2,
+                    y + (size - (initial_bbox[3] - initial_bbox[1])) / 2 - 2,
+                ),
+                initial,
+                font=initial_font,
+                fill=(122, 103, 84),
+            )
+
+        draw.ellipse((x, y, x + size, y + size), outline=(255, 255, 255, 220), width=3)
+        draw.text((x + size + 14, y + 13), name, font=self._font(28), fill=(74, 66, 59))
 
     def _wrap_text(self, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
         leading_punctuation = "，。！？；：、,.!?;:"
@@ -724,6 +942,22 @@ class AnimeJrysPlugin(Star):
         if not lines:
             return textwrap.wrap(text, width=18) or [text]
         return lines
+
+    def _ellipsize_text(self, text: str, font: ImageFont.ImageFont, max_width: int) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        if measure.textbbox((0, 0), value, font=font)[2] <= max_width:
+            return value
+        ellipsis = "..."
+        while value:
+            value = value[:-1]
+            trial = value.rstrip() + ellipsis
+            bbox = measure.textbbox((0, 0), trial, font=font)
+            if bbox[2] - bbox[0] <= max_width:
+                return trial
+        return ellipsis
 
     def _font(self, size: int, bold: bool = False) -> ImageFont.ImageFont:
         cache_key = (size, bold)

@@ -77,6 +77,12 @@
     "hint": "建议公开发布或上架插件市场时保持开启，以便提示图片来自第三方接口。",
     "default": true
   },
+  "show_user_badge": {
+    "description": "在海报左下角显示用户头像和昵称",
+    "type": "bool",
+    "hint": "默认开启。群聊中可用于区分是谁触发了今日运势；QQ 平台会优先使用群名片/昵称，并尝试拉取 QQ 头像。",
+    "default": true
+  },
   "font_path": {
     "description": "自定义字体路径",
     "type": "string",
