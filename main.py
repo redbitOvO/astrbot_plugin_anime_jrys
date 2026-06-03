@@ -1306,11 +1306,11 @@ class AnimeJrysPlugin(Star):
             summary = "暂无运势记录"
         draw.text((92, 910), summary, font=body_font, fill=(98, 87, 78))
 
-        self._draw_trend_chart(draw, (118, 970, 962, 1222), points, accent)
+        self._draw_trend_chart(draw, (118, 990, 962, 1190), points, accent)
 
         if len(valid_scores) < 2:
             draw.text(
-                (92, 1242),
+                (92, 1244),
                 "继续每日测运，曲线会逐渐变完整。",
                 font=small_font,
                 fill=(124, 116, 108),
