@@ -7,7 +7,7 @@ import os
 import random
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -81,6 +81,7 @@ DEFAULT_SAFEBOORU_EXCLUDED_TAGS = (
 )
 
 TRIGGER_WORDS = {"jrys", "今日运势", "运势"}
+TREND_TRIGGER_WORDS = {"ysqs", "运势趋势", "趋势"}
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -118,6 +119,7 @@ class FortuneRecord:
     display_name: str = ""
     avatar_url: str = ""
     avatar_path: str = ""
+    history: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _config_get(config: Any, key: str, default: Any) -> Any:
@@ -200,6 +202,7 @@ class AnimeJrysPlugin(Star):
         self._cache_dir = self._data_dir / "cache"
         self._avatars_dir = self._data_dir / "avatars"
         self._cards_dir = self._data_dir / "cards"
+        self._trend_cards_dir = self._data_dir / "trend_cards"
         self._base_cards_dir = self._data_dir / "base_cards"
         self._users_file = self._data_dir / "users.json"
         self._pool_file = self._data_dir / "image_pool.json"
@@ -210,6 +213,7 @@ class AnimeJrysPlugin(Star):
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._avatars_dir.mkdir(parents=True, exist_ok=True)
         self._cards_dir.mkdir(parents=True, exist_ok=True)
+        self._trend_cards_dir.mkdir(parents=True, exist_ok=True)
         self._base_cards_dir.mkdir(parents=True, exist_ok=True)
 
     async def initialize(self):
@@ -221,14 +225,23 @@ class AnimeJrysPlugin(Star):
         async for result in self._reply_fortune(event):
             yield result
 
+    @filter.command("ysqs", alias={"运势趋势", "趋势"})
+    async def ysqs(self, event: AstrMessageEvent):
+        """生成近 7 天运势趋势图。"""
+        async for result in self._reply_trend(event):
+            yield result
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_plain_trigger(self, event: AstrMessageEvent):
-        """兼容用户直接发送 jrys / 今日运势 / 运势。"""
+        """兼容用户直接发送触发词。"""
         text = getattr(event, "message_str", "").strip()
-        if text not in TRIGGER_WORDS:
+        if text in TRIGGER_WORDS:
+            async for result in self._reply_fortune(event):
+                yield result
             return
-        async for result in self._reply_fortune(event):
-            yield result
+        if text in TREND_TRIGGER_WORDS:
+            async for result in self._reply_trend(event):
+                yield result
 
     async def _reply_fortune(self, event: AstrMessageEvent):
         try:
@@ -241,6 +254,40 @@ class AnimeJrysPlugin(Star):
             yield event.plain_result("今日运势图生成失败了，请稍后再试。")
             event.stop_event()
 
+    async def _reply_trend(self, event: AstrMessageEvent):
+        try:
+            self._ensure_background_task()
+            record = await self._get_or_create_today_record(event)
+            user_key = _safe_user_id(event)
+            user_display = self._get_user_display(event)
+            avatar_path = await self._fetch_user_avatar(user_display)
+            trend_path = self._trend_cards_dir / f"{_today_str()}_{user_key}.jpg"
+            points = self._recent_fortune_points(record)
+            image_path = Path(record.image_path)
+            image_source = record.image_source
+            image_keyword = record.image_keyword
+            if not image_path.exists():
+                replacement = await self._fetch_random_image()
+                image_path = Path(replacement.url)
+                image_source = replacement.source
+                image_keyword = replacement.keyword
+            await asyncio.to_thread(
+                self._render_trend_card,
+                image_path,
+                trend_path,
+                points,
+                user_display.name,
+                avatar_path,
+                image_source,
+                image_keyword,
+            )
+            yield event.image_result(str(trend_path))
+            event.stop_event()
+        except Exception as exc:
+            logger.error(f"生成运势趋势图失败: {exc}")
+            yield event.plain_result("运势趋势图生成失败了，请稍后再试。")
+            event.stop_event()
+
     async def _get_or_create_today_record(self, event: AstrMessageEvent) -> FortuneRecord:
         user_key = _safe_user_id(event)
         today = _today_str()
@@ -251,6 +298,9 @@ class AnimeJrysPlugin(Star):
             if existing.get("day") == today and existing.get("card_path"):
                 card_path = Path(existing["card_path"])
                 if card_path.exists() and self._record_has_display_badge(existing):
+                    if self._ensure_record_history(existing):
+                        users[user_key] = existing
+                        await asyncio.to_thread(self._save_users, users)
                     return FortuneRecord(**existing)
                 if card_path.exists() and existing.get("image_path"):
                     image_path = Path(str(existing["image_path"]))
@@ -272,6 +322,7 @@ class AnimeJrysPlugin(Star):
                         existing["display_name"] = user_display.name
                         existing["avatar_url"] = user_display.avatar_url
                         existing["avatar_path"] = avatar_path
+                        self._ensure_record_history(existing)
                         users[user_key] = existing
                         await asyncio.to_thread(self._save_users, users)
                         return FortuneRecord(**existing)
@@ -309,6 +360,7 @@ class AnimeJrysPlugin(Star):
                 display_name=user_display.name,
                 avatar_url=user_display.avatar_url,
                 avatar_path=avatar_path,
+                history=self._updated_history(existing, today, score),
             )
             users[user_key] = record.__dict__
             await asyncio.to_thread(self._save_users, users)
@@ -334,6 +386,57 @@ class AnimeJrysPlugin(Star):
         if prev == now:
             return max(1, previous_streak)
         return 1
+
+    def _ensure_record_history(self, record: dict[str, Any]) -> bool:
+        day = str(record.get("day", "") or "")
+        if not day:
+            return False
+        try:
+            score = int(record.get("score", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        history = self._updated_history(record, day, score)
+        if history == record.get("history"):
+            return False
+        record["history"] = history
+        return True
+
+    def _updated_history(
+        self, existing: dict[str, Any], day: str, score: int
+    ) -> list[dict[str, Any]]:
+        by_day: dict[str, int] = {}
+
+        def put(day_text: str, score_value: Any) -> None:
+            try:
+                parsed_day = date.fromisoformat(str(day_text))
+                parsed_score = int(score_value)
+            except (TypeError, ValueError):
+                return
+            by_day[parsed_day.isoformat()] = max(0, min(100, parsed_score))
+
+        history = existing.get("history", [])
+        if isinstance(history, list):
+            for item in history:
+                if isinstance(item, dict):
+                    put(str(item.get("day", "")), item.get("score"))
+
+        put(str(existing.get("day", "")), existing.get("score"))
+        put(day, score)
+
+        return [
+            {"day": day_text, "score": by_day[day_text]}
+            for day_text in sorted(by_day.keys())[-60:]
+        ]
+
+    def _recent_fortune_points(self, record: FortuneRecord) -> list[tuple[str, int | None]]:
+        try:
+            end_day = date.fromisoformat(record.day)
+        except ValueError:
+            end_day = date.today()
+        history = self._updated_history(record.__dict__, record.day, record.score)
+        by_day = {str(item["day"]): int(item["score"]) for item in history}
+        days = [end_day - timedelta(days=offset) for offset in range(6, -1, -1)]
+        return [(day.isoformat(), by_day.get(day.isoformat())) for day in days]
 
     def _roll_fortune(self) -> tuple[int, str, str]:
         bands = [
@@ -596,6 +699,12 @@ class AnimeJrysPlugin(Star):
             protected,
         )
         self._delete_old_files(
+            self._trend_cards_dir,
+            _config_int(self.config, "card_retention_days", 7, 1, 3650),
+            now,
+            protected,
+        )
+        self._delete_old_files(
             self._cache_dir,
             _config_int(self.config, "image_cache_retention_days", 14, 1, 3650),
             now,
@@ -679,7 +788,13 @@ class AnimeJrysPlugin(Star):
         max_bytes = max_mb * 1024 * 1024
         files: list[tuple[float, int, Path]] = []
         total = 0
-        for directory in (self._cache_dir, self._avatars_dir, self._cards_dir, self._base_cards_dir):
+        for directory in (
+            self._cache_dir,
+            self._avatars_dir,
+            self._cards_dir,
+            self._trend_cards_dir,
+            self._base_cards_dir,
+        ):
             if not directory.exists():
                 continue
             for path in directory.rglob("*"):
@@ -1160,6 +1275,133 @@ class AnimeJrysPlugin(Star):
         except OSError:
             return True
         return age_seconds > days * 86400
+
+    def _render_trend_card(
+        self,
+        image_path: Path,
+        output_path: Path,
+        points: list[tuple[str, int | None]],
+        display_name: str,
+        avatar_path: str,
+        image_source: str,
+        image_keyword: str,
+    ) -> None:
+        bg = self._create_base_card_image(image_path, image_source, image_keyword)
+        draw = ImageDraw.Draw(bg)
+
+        title_font = self._font(44, bold=True)
+        body_font = self._font(28)
+        small_font = self._font(22)
+
+        valid_scores = [score for _day, score in points if score is not None]
+        latest_score = valid_scores[-1] if valid_scores else 0
+        accent = self._accent_for_score(latest_score)
+
+        draw.text((90, 850), "近7天运势曲线", font=title_font, fill=(53, 48, 43))
+        if valid_scores:
+            average = round(sum(valid_scores) / len(valid_scores), 1)
+            best = max(valid_scores)
+            summary = f"记录 {len(valid_scores)} 天  平均 {average}  最高 {best}"
+        else:
+            summary = "暂无运势记录"
+        draw.text((92, 910), summary, font=body_font, fill=(98, 87, 78))
+
+        self._draw_trend_chart(draw, (118, 970, 962, 1222), points, accent)
+
+        if len(valid_scores) < 2:
+            draw.text(
+                (92, 1242),
+                "继续每日测运，曲线会逐渐变完整。",
+                font=small_font,
+                fill=(124, 116, 108),
+            )
+
+        if _config_bool(self.config, "show_user_badge", True):
+            self._draw_user_badge(bg, draw, display_name, avatar_path)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._save_card_image(bg, output_path)
+
+    def _draw_trend_chart(
+        self,
+        draw: ImageDraw.ImageDraw,
+        box: tuple[int, int, int, int],
+        points: list[tuple[str, int | None]],
+        accent: tuple[int, int, int],
+    ) -> None:
+        left, top, right, bottom = box
+        width = right - left
+        height = bottom - top
+        axis_color = (182, 170, 157)
+        grid_color = (226, 218, 207)
+        text_color = (98, 87, 78)
+        label_font = self._font(20)
+        score_font = self._font(24, bold=True)
+
+        for tick in (100, 75, 50, 25, 0):
+            y = top + int((100 - tick) / 100 * height)
+            draw.line((left, y, right, y), fill=grid_color, width=1)
+            label = str(tick)
+            bbox = draw.textbbox((0, 0), label, font=label_font)
+            draw.text(
+                (left - 14 - (bbox[2] - bbox[0]), y - 11),
+                label,
+                font=label_font,
+                fill=text_color,
+            )
+
+        draw.line((left, top, left, bottom), fill=axis_color, width=2)
+        draw.line((left, bottom, right, bottom), fill=axis_color, width=2)
+
+        coordinates: list[tuple[int, int] | None] = []
+        total = max(1, len(points) - 1)
+        for index, (day_text, score) in enumerate(points):
+            x = left + int(width * index / total)
+            short_day = self._format_short_date(day_text)
+            day_bbox = draw.textbbox((0, 0), short_day, font=label_font)
+            draw.text(
+                (x - (day_bbox[2] - day_bbox[0]) / 2, bottom + 18),
+                short_day,
+                font=label_font,
+                fill=text_color,
+            )
+            if score is None:
+                draw.ellipse((x - 5, bottom - 5, x + 5, bottom + 5), fill=(214, 205, 194))
+                coordinates.append(None)
+                continue
+            y = top + int((100 - score) / 100 * height)
+            coordinates.append((x, y))
+
+        segment: list[tuple[int, int]] = []
+        for point in coordinates + [None]:
+            if point is None:
+                if len(segment) >= 2:
+                    draw.line(segment, fill=(184, 143, 98), width=8, joint="curve")
+                    draw.line(segment, fill=accent, width=5, joint="curve")
+                segment = []
+                continue
+            segment.append(point)
+
+        for (_day_text, score), point in zip(points, coordinates):
+            if point is None or score is None:
+                continue
+            x, y = point
+            draw.ellipse((x - 10, y - 10, x + 10, y + 10), fill=(255, 253, 248), outline=accent, width=4)
+            label = str(score)
+            bbox = draw.textbbox((0, 0), label, font=score_font)
+            draw.text(
+                (x - (bbox[2] - bbox[0]) / 2, y - 42),
+                label,
+                font=score_font,
+                fill=accent,
+            )
+
+    def _format_short_date(self, day_text: str) -> str:
+        try:
+            parsed = date.fromisoformat(day_text)
+            return parsed.strftime("%m/%d")
+        except ValueError:
+            return day_text[-5:]
 
     def _render_card(
         self,
