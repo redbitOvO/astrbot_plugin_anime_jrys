@@ -1291,7 +1291,6 @@ class AnimeJrysPlugin(Star):
 
         title_font = self._font(44, bold=True)
         body_font = self._font(28)
-        small_font = self._font(22)
 
         valid_scores = [score for _day, score in points if score is not None]
         latest_score = valid_scores[-1] if valid_scores else 0
@@ -1307,14 +1306,6 @@ class AnimeJrysPlugin(Star):
         draw.text((92, 910), summary, font=body_font, fill=(98, 87, 78))
 
         self._draw_trend_chart(draw, (118, 990, 962, 1190), points, accent)
-
-        if len(valid_scores) < 2:
-            draw.text(
-                (92, 1244),
-                "继续每日测运，曲线会逐渐变完整。",
-                font=small_font,
-                fill=(124, 116, 108),
-            )
 
         if _config_bool(self.config, "show_user_badge", True):
             self._draw_user_badge(bg, draw, display_name, avatar_path)
