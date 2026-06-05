@@ -323,8 +323,11 @@ class AnimeJrysPlugin(Star):
 
     async def _reply_shop(self, event: AstrMessageEvent):
         self._open_shop_session(event)
+        balance = await self._current_coin_balance(event)
         text = (
-            "欢迎进入今日商店！以下是可用商品："
+            "欢迎进入今日商店！\n"
+            f"金币余额：{balance}\n"
+            "以下是可用商品："
             f"商品1：{self._reroll_cost()}金币——重新测运；"
             f"商品2：{self._shop_sfw_image_cost()}金币——随机图片；"
             f"商品3：{self._shop_nsfw_image_cost()}金币——随机涩图。"
@@ -559,6 +562,19 @@ class AnimeJrysPlugin(Star):
     def _coin_balance(self, record: dict[str, Any]) -> int:
         self._ensure_record_economy(record)
         return int(record.get("coins", 0) or 0)
+
+    async def _current_coin_balance(self, event: AstrMessageEvent) -> int:
+        user_key = _safe_user_id(event)
+        async with self._lock:
+            users = await asyncio.to_thread(self._load_users)
+            record = users.get(user_key, {})
+            if not isinstance(record, dict):
+                record = {}
+            changed = self._ensure_record_economy(record)
+            if user_key in users and changed:
+                users[user_key] = record
+                await asyncio.to_thread(self._save_users, users)
+            return self._coin_balance(record)
 
     def _award_coins_for_score(self, existing: dict[str, Any], score: int) -> tuple[int, int]:
         current = self._coin_balance(existing)
