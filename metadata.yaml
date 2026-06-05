@@ -1,8 +1,8 @@
 name: astrbot_plugin_anime_jrys
 display_name: 动漫今日运势
-short_desc: 生成带随机动漫/二游横图的今日运势海报。
-desc: 输入 jrys 或 /jrys，返回随机动漫/二游横图、运势分数、短文案和连续测运天数；输入 ysqs 或 /ysqs，返回近 7 天运势曲线图。图片来自第三方公开接口，默认仅请求 SFW 内容。
-version: v0.2.0
+short_desc: 生成带随机动漫/二游横图的今日运势海报，支持金币商店。
+desc: 输入 jrys 或 /jrys，返回随机动漫/二游横图、运势分数、短文案、金币奖励和连续测运天数；输入 ysqs 或 /ysqs，返回近 7 天运势曲线图；输入 jrsd 或 /jrsd，进入今日商店。图片来自第三方公开接口。
+version: v0.3.0
 author: redbitOvO
 repo: https://github.com/redbitOvO/astrbot_plugin_anime_jrys
 astrbot_version: ">=4.9.2"

@@ -47,6 +47,30 @@
     "hint": "多个标签请用英文分号 ; 分隔。用于避开擦边、GIF、设定图、草稿或漫画页等不适合做海报背景的结果。",
     "default": "underwear;bikini;swimsuit;lingerie;nude;naked;sex;explicit;animated_gif;character_sheet;reference_sheet;sketch;comic;manga;ass;bottomless;kiss;french_kiss;tongue;tongue_out;armpits;sports_bra;leotard;midriff;navel;nipples;pectorals;bulge;spread_legs;wide_spread_legs;feet;soles"
   },
+  "enable_danbooru_source": {
+    "description": "启用 Danbooru SFW 关键词源",
+    "type": "bool",
+    "hint": "默认关闭。开启后 jrys 和商店普通随机图会把 Danbooru 作为 SFW 关键词图源，只请求 rating:s 内容。Danbooru 在部分云服务器上可能被 Cloudflare 返回 403，建议配合 danbooru_login / danbooru_api_key 使用。",
+    "default": false
+  },
+  "danbooru_tags": {
+    "description": "Danbooru SFW 标签",
+    "type": "text",
+    "hint": "多个标签请用英文分号 ; 分隔。仅在启用 Danbooru SFW 关键词源且配置不为空时生效。例如：wuthering_waves;genshin_impact;blue_archive",
+    "default": "genshin_impact;honkai:_star_rail;honkai_impact_3rd;zenless_zone_zero;wuthering_waves;arknights;blue_archive;azur_lane;girls'_frontline;goddess_of_victory:_nikke;punishing:_gray_raven;path_to_nowhere;reverse:1999;fate/grand_order;umamusume"
+  },
+  "danbooru_sfw_min_score": {
+    "description": "Danbooru SFW 最低 score",
+    "type": "text",
+    "hint": "默认 20。插件会优先取 rating:s、横图、score 较高且不含排除标签的作品。调高会更挑图，但可能更容易无结果。",
+    "default": "20"
+  },
+  "danbooru_sfw_excluded_tags": {
+    "description": "Danbooru SFW 排除标签",
+    "type": "text",
+    "hint": "多个标签请用英文分号 ; 分隔。用于避开擦边、GIF、设定图、草稿或漫画页等不适合做海报背景的结果。",
+    "default": "underwear;bikini;swimsuit;lingerie;nude;naked;sex;explicit;animated_gif;character_sheet;reference_sheet;sketch;comic;manga;ass;bottomless;kiss;french_kiss;tongue;tongue_out;armpits;sports_bra;leotard;midriff;navel;nipples;pectorals;bulge;spread_legs;wide_spread_legs;feet;soles"
+  },
   "keyword_source_timeout_seconds": {
     "description": "关键词源请求超时秒数",
     "type": "text",
@@ -166,6 +190,126 @@
     "type": "bool",
     "hint": "默认关闭。开启后文件通常更小，但保存图片会多花一点 CPU 时间；更适合画质优先或带宽较慢的服务器。",
     "default": false
+  },
+  "enable_coin_system": {
+    "description": "启用金币系统",
+    "type": "bool",
+    "hint": "默认开启。用户每日首次测运会获得金币，金币可在今日商店中消费。",
+    "default": true
+  },
+  "coin_cap": {
+    "description": "金币储存上限",
+    "type": "text",
+    "hint": "默认 100。用户金币余额不会超过这个数值。",
+    "default": "100"
+  },
+  "coin_award_min": {
+    "description": "单次测运最少金币",
+    "type": "text",
+    "hint": "默认 1。金币发放会与运势分数相关，低运势更偏向较低数额。",
+    "default": "1"
+  },
+  "coin_award_max": {
+    "description": "单次测运最多金币",
+    "type": "text",
+    "hint": "默认 10。金币发放会与运势分数相关，高运势更偏向较高数额。",
+    "default": "10"
+  },
+  "reroll_cost": {
+    "description": "重新测运价格",
+    "type": "text",
+    "hint": "默认 2。购买后会覆盖当天旧运势，重测不再发放金币。",
+    "default": "2"
+  },
+  "shop_sfw_image_cost": {
+    "description": "随机图片价格",
+    "type": "text",
+    "hint": "默认 5。购买成功后发送普通 SFW 随机动漫原图。",
+    "default": "5"
+  },
+  "shop_nsfw_image_cost": {
+    "description": "随机涩图价格",
+    "type": "text",
+    "hint": "默认 8。购买成功后发送 18+ 随机原图。",
+    "default": "8"
+  },
+  "shop_session_ttl_seconds": {
+    "description": "商店会话有效期秒数",
+    "type": "text",
+    "hint": "默认 60。用户发送 jrsd 后，只有该用户在有效期内输入 1/2/3 才能购买。",
+    "default": "60"
+  },
+  "enable_nsfw_shop": {
+    "description": "启用 18+ 商店商品",
+    "type": "bool",
+    "hint": "默认开启。公开群聊使用前请确认机器人所在群规则和平台规范。",
+    "default": true
+  },
+  "nsfw_sources": {
+    "description": "18+ 图源顺序",
+    "type": "text",
+    "hint": "默认 yandere;danbooru;gelbooru。多个图源用英文分号 ; 分隔。Danbooru / Gelbooru 在部分服务器上可能需要登录或 API 权限，Yande.re 通常更适合作为无鉴权默认源。",
+    "default": "yandere;danbooru;gelbooru"
+  },
+  "yandere_min_score": {
+    "description": "Yande.re 最低 score",
+    "type": "text",
+    "hint": "默认 20。调高会更挑图，但可能更容易获取失败。",
+    "default": "20"
+  },
+  "danbooru_login": {
+    "description": "Danbooru 用户名",
+    "type": "string",
+    "hint": "可选。Danbooru 匿名访问返回 403 时，可填写账号用户名并配合 danbooru_api_key 使用。不要把账号信息写进公开仓库。",
+    "default": ""
+  },
+  "danbooru_api_key": {
+    "description": "Danbooru API Key",
+    "type": "string",
+    "hint": "可选。与 danbooru_login 配套使用。API Key 属于敏感信息，只建议在自己的 AstrBot 配置面板填写。",
+    "default": ""
+  },
+  "danbooru_min_score": {
+    "description": "Danbooru 最低 score",
+    "type": "text",
+    "hint": "默认 20。调高会更挑图，但可能更容易获取失败。",
+    "default": "20"
+  },
+  "gelbooru_user_id": {
+    "description": "Gelbooru User ID",
+    "type": "string",
+    "hint": "可选。Gelbooru API 返回 401 时，可填写账号页面中的 user_id 并配合 gelbooru_api_key 使用。不要把账号信息写进公开仓库。",
+    "default": ""
+  },
+  "gelbooru_api_key": {
+    "description": "Gelbooru API Key",
+    "type": "string",
+    "hint": "可选。与 gelbooru_user_id 配套使用。API Key 属于敏感信息，只建议在自己的 AstrBot 配置面板填写。",
+    "default": ""
+  },
+  "gelbooru_min_score": {
+    "description": "Gelbooru 最低 score",
+    "type": "text",
+    "hint": "默认 25。调高会更挑图，但可能更容易获取失败。",
+    "default": "25"
+  },
+  "nsfw_excluded_tags": {
+    "description": "18+ 图源排除标签",
+    "type": "text",
+    "hint": "多个标签用英文分号 ; 分隔。默认排除未成年相关、极端内容、GIF、低清和草稿等标签。",
+    "default": "loli;shota;child;young;underage;aged_down;infant;toddler;baby;kindergarten;elementary_school;middle_school;guro;scat;vore;bestiality;rape;animated_gif;comic;manga;sketch;lowres;bad_anatomy;translation_request"
+  },
+  "shop_image_cache_retention_days": {
+    "description": "商店图片缓存保留天数",
+    "type": "text",
+    "hint": "默认 7。商店购买到的原图会缓存在 shop_cache 中，并按此项定时清理。",
+    "default": "7"
+  },
+  "shop_image_min_long_edge": {
+    "description": "商店图片最小长边",
+    "type": "text",
+    "hint": "默认 1200。普通和 18+ 商店图片都需要达到该长边尺寸，避免低质量小图。",
+    "default": "1200"
   },
   "font_path": {
     "description": "自定义字体路径",

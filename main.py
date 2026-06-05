@@ -73,15 +73,29 @@ DEFAULT_SAFEBOORU_TAGS = (
     "goddess_of_victory:_nikke;punishing:_gray_raven;path_to_nowhere;"
     "reverse:1999;fate/grand_order;umamusume"
 )
+DEFAULT_DANBOORU_TAGS = (
+    "genshin_impact;honkai:_star_rail;honkai_impact_3rd;zenless_zone_zero;"
+    "wuthering_waves;arknights;blue_archive;azur_lane;girls'_frontline;"
+    "goddess_of_victory:_nikke;punishing:_gray_raven;path_to_nowhere;"
+    "reverse:1999;fate/grand_order;umamusume"
+)
 DEFAULT_SAFEBOORU_EXCLUDED_TAGS = (
     "underwear;bikini;swimsuit;lingerie;nude;naked;sex;explicit;animated_gif;"
     "character_sheet;reference_sheet;sketch;comic;manga;ass;bottomless;kiss;"
     "french_kiss;tongue;tongue_out;armpits;sports_bra;leotard;midriff;navel;"
     "nipples;pectorals;bulge;spread_legs;wide_spread_legs;feet;soles"
 )
+DEFAULT_NSFW_EXCLUDED_TAGS = (
+    "loli;shota;child;young;underage;aged_down;infant;toddler;baby;kindergarten;"
+    "elementary_school;middle_school;guro;scat;vore;bestiality;rape;animated_gif;"
+    "comic;manga;sketch;lowres;bad_anatomy;translation_request"
+)
+DEFAULT_NSFW_SOURCES = "yandere;danbooru;gelbooru"
 
 TRIGGER_WORDS = {"jrys", "今日运势", "运势"}
 TREND_TRIGGER_WORDS = {"ysqs", "运势趋势", "趋势"}
+SHOP_TRIGGER_WORDS = {"jrsd", "今日商店", "商店"}
+SHOP_PRODUCT_CODES = {"1", "2", "3"}
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -120,6 +134,8 @@ class FortuneRecord:
     avatar_url: str = ""
     avatar_path: str = ""
     history: list[dict[str, Any]] = field(default_factory=list)
+    coins: int = 0
+    last_coin_gain: int = 0
 
 
 def _config_get(config: Any, key: str, default: Any) -> Any:
@@ -200,6 +216,7 @@ class AnimeJrysPlugin(Star):
         self._lock = asyncio.Lock()
         self._data_dir = self._get_plugin_data_dir()
         self._cache_dir = self._data_dir / "cache"
+        self._shop_cache_dir = self._data_dir / "shop_cache"
         self._avatars_dir = self._data_dir / "avatars"
         self._cards_dir = self._data_dir / "cards"
         self._trend_cards_dir = self._data_dir / "trend_cards"
@@ -210,7 +227,9 @@ class AnimeJrysPlugin(Star):
         self._prefetch_lock = asyncio.Lock()
         self._maintenance_lock = asyncio.Lock()
         self._background_task: asyncio.Task | None = None
+        self._shop_sessions: dict[str, dict[str, Any]] = {}
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._shop_cache_dir.mkdir(parents=True, exist_ok=True)
         self._avatars_dir.mkdir(parents=True, exist_ok=True)
         self._cards_dir.mkdir(parents=True, exist_ok=True)
         self._trend_cards_dir.mkdir(parents=True, exist_ok=True)
@@ -231,6 +250,12 @@ class AnimeJrysPlugin(Star):
         async for result in self._reply_trend(event):
             yield result
 
+    @filter.command("jrsd", alias={"今日商店", "商店"})
+    async def jrsd(self, event: AstrMessageEvent):
+        """打开今日商店。"""
+        async for result in self._reply_shop(event):
+            yield result
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_plain_trigger(self, event: AstrMessageEvent):
         """兼容用户直接发送触发词。"""
@@ -241,6 +266,14 @@ class AnimeJrysPlugin(Star):
             return
         if text in TREND_TRIGGER_WORDS:
             async for result in self._reply_trend(event):
+                yield result
+            return
+        if text in SHOP_TRIGGER_WORDS:
+            async for result in self._reply_shop(event):
+                yield result
+            return
+        if self._has_active_shop_session(event) and (text in SHOP_PRODUCT_CODES or text.isdigit()):
+            async for result in self._reply_shop_purchase(event, text):
                 yield result
 
     async def _reply_fortune(self, event: AstrMessageEvent):
@@ -288,6 +321,80 @@ class AnimeJrysPlugin(Star):
             yield event.plain_result("运势趋势图生成失败了，请稍后再试。")
             event.stop_event()
 
+    async def _reply_shop(self, event: AstrMessageEvent):
+        self._open_shop_session(event)
+        text = (
+            "欢迎进入今日商店！以下是可用商品："
+            f"商品1：{self._reroll_cost()}金币——重新测运；"
+            f"商品2：{self._shop_sfw_image_cost()}金币——随机图片；"
+            f"商品3：{self._shop_nsfw_image_cost()}金币——随机涩图。"
+            "请输入商品编号进行购买！"
+        )
+        yield event.plain_result(text)
+        event.stop_event()
+
+    async def _reply_shop_purchase(self, event: AstrMessageEvent, product_code: str):
+        if not self._consume_shop_session(event):
+            return
+        if product_code not in SHOP_PRODUCT_CODES:
+            yield event.plain_result("商品编号无效，请重新发送 jrsd 打开今日商店。")
+            event.stop_event()
+            return
+
+        try:
+            if product_code == "1":
+                record = await self._buy_reroll(event)
+                yield event.plain_result("购买成功！正在重新测运~")
+                yield event.image_result(record.card_path)
+                event.stop_event()
+                return
+
+            if product_code == "2":
+                if not await self._can_afford_shop_cost(event, self._shop_sfw_image_cost()):
+                    yield event.plain_result("金币不足，购买失败。")
+                    event.stop_event()
+                    return
+                image = await self._fetch_shop_sfw_image()
+                success = await self._deduct_shop_cost(event, self._shop_sfw_image_cost())
+                if not success:
+                    yield event.plain_result("金币不足，购买失败。")
+                    event.stop_event()
+                    return
+                yield event.plain_result("购买成功！这是你的图片~")
+                yield event.image_result(image.url)
+                event.stop_event()
+                return
+
+            if not _config_bool(self.config, "enable_nsfw_shop", True):
+                yield event.plain_result("随机涩图商品当前未开启。")
+                event.stop_event()
+                return
+            if not await self._can_afford_shop_cost(event, self._shop_nsfw_image_cost()):
+                yield event.plain_result("金币不足，购买失败。")
+                event.stop_event()
+                return
+            image = await self._fetch_shop_nsfw_image()
+            success = await self._deduct_shop_cost(event, self._shop_nsfw_image_cost())
+            if not success:
+                yield event.plain_result("金币不足，购买失败。")
+                event.stop_event()
+                return
+            yield event.plain_result("购买成功！这是你的图片~")
+            yield event.image_result(image.url)
+            event.stop_event()
+        except RuntimeError as exc:
+            message = str(exc)
+            if "金币不足" in message or "请先" in message:
+                yield event.plain_result(message)
+            else:
+                logger.error(f"今日商店购买失败: {exc}")
+                yield event.plain_result("购买失败了，金币未扣除，请稍后再试。")
+            event.stop_event()
+        except Exception as exc:
+            logger.error(f"今日商店购买失败: {exc}")
+            yield event.plain_result("购买失败了，金币未扣除，请稍后再试。")
+            event.stop_event()
+
     async def _get_or_create_today_record(self, event: AstrMessageEvent) -> FortuneRecord:
         user_key = _safe_user_id(event)
         today = _today_str()
@@ -296,9 +403,15 @@ class AnimeJrysPlugin(Star):
             users = await asyncio.to_thread(self._load_users)
             existing = users.get(user_key, {})
             if existing.get("day") == today and existing.get("card_path"):
+                economy_changed = self._ensure_record_economy(existing)
                 card_path = Path(existing["card_path"])
-                if card_path.exists() and self._record_has_display_badge(existing):
-                    if self._ensure_record_history(existing):
+                if (
+                    card_path.exists()
+                    and self._record_has_display_badge(existing)
+                    and not economy_changed
+                ):
+                    history_changed = self._ensure_record_history(existing)
+                    if history_changed:
                         users[user_key] = existing
                         await asyncio.to_thread(self._save_users, users)
                     return FortuneRecord(**existing)
@@ -318,6 +431,8 @@ class AnimeJrysPlugin(Star):
                             str(existing.get("image_keyword", "")),
                             user_display.name,
                             avatar_path,
+                            int(existing.get("last_coin_gain", 0) or 0),
+                            int(existing.get("coins", 0) or 0),
                         )
                         existing["display_name"] = user_display.name
                         existing["avatar_url"] = user_display.avatar_url
@@ -326,9 +441,15 @@ class AnimeJrysPlugin(Star):
                         users[user_key] = existing
                         await asyncio.to_thread(self._save_users, users)
                         return FortuneRecord(**existing)
+                if card_path.exists():
+                    self._ensure_record_history(existing)
+                    users[user_key] = existing
+                    await asyncio.to_thread(self._save_users, users)
+                    return FortuneRecord(**existing)
 
             streak = self._next_streak(existing, today)
             score, tier, text = self._roll_fortune()
+            coin_gain, coins = self._award_coins_for_score(existing, score)
             used_image_paths = self._today_used_image_paths(users)
             image = await self._fetch_random_image(used_image_paths)
             avatar_path = await self._fetch_user_avatar(user_display)
@@ -345,6 +466,8 @@ class AnimeJrysPlugin(Star):
                 image.keyword,
                 user_display.name,
                 avatar_path,
+                coin_gain,
+                coins,
             )
 
             record = FortuneRecord(
@@ -361,6 +484,8 @@ class AnimeJrysPlugin(Star):
                 avatar_url=user_display.avatar_url,
                 avatar_path=avatar_path,
                 history=self._updated_history(existing, today, score),
+                coins=coins,
+                last_coin_gain=coin_gain,
             )
             users[user_key] = record.__dict__
             await asyncio.to_thread(self._save_users, users)
@@ -370,6 +495,197 @@ class AnimeJrysPlugin(Star):
         if not _config_bool(self.config, "show_user_badge", True):
             return True
         return bool(str(record.get("display_name", "")).strip())
+
+    def _coin_system_enabled(self) -> bool:
+        return _config_bool(self.config, "enable_coin_system", True)
+
+    def _coin_cap(self) -> int:
+        return _config_int(self.config, "coin_cap", 100, 1, 100000)
+
+    def _coin_award_min(self) -> int:
+        return _config_int(self.config, "coin_award_min", 1, 0, 1000)
+
+    def _coin_award_max(self) -> int:
+        minimum = self._coin_award_min()
+        return max(minimum, _config_int(self.config, "coin_award_max", 10, minimum, 1000))
+
+    def _reroll_cost(self) -> int:
+        return _config_int(self.config, "reroll_cost", 2, 0, 100000)
+
+    def _shop_sfw_image_cost(self) -> int:
+        return _config_int(self.config, "shop_sfw_image_cost", 5, 0, 100000)
+
+    def _shop_nsfw_image_cost(self) -> int:
+        return _config_int(self.config, "shop_nsfw_image_cost", 8, 0, 100000)
+
+    def _shop_session_ttl_seconds(self) -> int:
+        return _config_int(self.config, "shop_session_ttl_seconds", 60, 10, 3600)
+
+    def _danbooru_auth_query(self) -> str:
+        login = str(_config_get(self.config, "danbooru_login", "") or "").strip()
+        api_key = str(_config_get(self.config, "danbooru_api_key", "") or "").strip()
+        if not login or not api_key:
+            return ""
+        return f"&login={quote_plus(login)}&api_key={quote_plus(api_key)}"
+
+    def _gelbooru_auth_query(self) -> str:
+        user_id = str(_config_get(self.config, "gelbooru_user_id", "") or "").strip()
+        api_key = str(_config_get(self.config, "gelbooru_api_key", "") or "").strip()
+        if not user_id or not api_key:
+            return ""
+        return f"&user_id={quote_plus(user_id)}&api_key={quote_plus(api_key)}"
+
+    def _ensure_record_economy(self, record: dict[str, Any]) -> bool:
+        changed = False
+        cap = self._coin_cap()
+        try:
+            coins = int(record.get("coins", 0) or 0)
+        except (TypeError, ValueError):
+            coins = 0
+        coins = max(0, min(cap, coins))
+        if record.get("coins") != coins:
+            record["coins"] = coins
+            changed = True
+        try:
+            last_coin_gain = int(record.get("last_coin_gain", 0) or 0)
+        except (TypeError, ValueError):
+            last_coin_gain = 0
+        last_coin_gain = max(0, last_coin_gain)
+        if record.get("last_coin_gain") != last_coin_gain:
+            record["last_coin_gain"] = last_coin_gain
+            changed = True
+        return changed
+
+    def _coin_balance(self, record: dict[str, Any]) -> int:
+        self._ensure_record_economy(record)
+        return int(record.get("coins", 0) or 0)
+
+    def _award_coins_for_score(self, existing: dict[str, Any], score: int) -> tuple[int, int]:
+        current = self._coin_balance(existing)
+        if not self._coin_system_enabled():
+            return 0, current
+        minimum = self._coin_award_min()
+        maximum = self._coin_award_max()
+        if maximum <= minimum:
+            gain = minimum
+        elif score < 25:
+            gain = random.randint(minimum, min(maximum, minimum + 3))
+        elif score < 50:
+            gain = random.randint(min(maximum, minimum + 2), min(maximum, minimum + 6))
+        elif score < 70:
+            gain = random.randint(min(maximum, minimum + 3), min(maximum, minimum + 7))
+        elif score < 90:
+            gain = random.randint(min(maximum, minimum + 5), maximum)
+        else:
+            gain = random.randint(min(maximum, minimum + 7), maximum)
+        return gain, min(self._coin_cap(), current + gain)
+
+    def _open_shop_session(self, event: AstrMessageEvent) -> None:
+        user_key = _safe_user_id(event)
+        self._shop_sessions[user_key] = {
+            "expires_at": time.time() + self._shop_session_ttl_seconds(),
+        }
+
+    def _has_active_shop_session(self, event: AstrMessageEvent) -> bool:
+        user_key = _safe_user_id(event)
+        session = self._shop_sessions.get(user_key)
+        if not session:
+            return False
+        if float(session.get("expires_at", 0) or 0) < time.time():
+            self._shop_sessions.pop(user_key, None)
+            return False
+        return True
+
+    def _consume_shop_session(self, event: AstrMessageEvent) -> bool:
+        if not self._has_active_shop_session(event):
+            return False
+        self._shop_sessions.pop(_safe_user_id(event), None)
+        return True
+
+    async def _can_afford_shop_cost(self, event: AstrMessageEvent, cost: int) -> bool:
+        if cost <= 0:
+            return True
+        user_key = _safe_user_id(event)
+        async with self._lock:
+            users = await asyncio.to_thread(self._load_users)
+            record = users.get(user_key, {})
+            self._ensure_record_economy(record)
+            return self._coin_balance(record) >= cost
+
+    async def _deduct_shop_cost(self, event: AstrMessageEvent, cost: int) -> bool:
+        if cost <= 0:
+            return True
+        user_key = _safe_user_id(event)
+        async with self._lock:
+            users = await asyncio.to_thread(self._load_users)
+            record = users.get(user_key, {})
+            self._ensure_record_economy(record)
+            if self._coin_balance(record) < cost:
+                return False
+            record["coins"] = self._coin_balance(record) - cost
+            users[user_key] = record
+            await asyncio.to_thread(self._save_users, users)
+            return True
+
+    async def _buy_reroll(self, event: AstrMessageEvent) -> FortuneRecord:
+        user_key = _safe_user_id(event)
+        today = _today_str()
+        user_display = self._get_user_display(event)
+        cost = self._reroll_cost()
+        async with self._lock:
+            users = await asyncio.to_thread(self._load_users)
+            existing = users.get(user_key, {})
+            if existing.get("day") != today or not existing.get("card_path"):
+                raise RuntimeError("请先发送 jrys 获取今日运势，再购买重新测运。")
+            self._ensure_record_economy(existing)
+            if self._coin_balance(existing) < cost:
+                raise RuntimeError("金币不足，购买失败。")
+            old_score = int(existing.get("score", -1) or -1)
+            streak = int(existing.get("streak", 1) or 1)
+            score, tier, text = self._roll_fortune_excluding_score(old_score)
+            blocked_paths = self._today_used_image_paths(users)
+            old_image = str(existing.get("image_path", "") or "")
+            if old_image:
+                blocked_paths.add(self._normalize_path_key(Path(old_image)))
+            image = await self._fetch_random_image(blocked_paths)
+            avatar_path = await self._fetch_user_avatar(user_display)
+            coins = max(0, self._coin_balance(existing) - cost)
+            card_path = self._cards_dir / f"{today}_{user_key}.jpg"
+            await asyncio.to_thread(
+                self._render_card,
+                Path(image.url),
+                card_path,
+                score,
+                tier,
+                text,
+                streak,
+                image.source,
+                image.keyword,
+                user_display.name,
+                avatar_path,
+                0,
+                coins,
+            )
+            record = FortuneRecord(
+                day=today,
+                score=score,
+                tier=tier,
+                text=text,
+                streak=streak,
+                image_path=image.url,
+                image_source=image.source,
+                image_keyword=image.keyword,
+                card_path=str(card_path),
+                display_name=user_display.name,
+                avatar_url=user_display.avatar_url,
+                avatar_path=avatar_path,
+                history=self._updated_history(existing, today, score),
+                coins=coins,
+                last_coin_gain=0,
+            )
+            users[user_key] = record.__dict__
+            await asyncio.to_thread(self._save_users, users)
+            return record
 
     def _next_streak(self, existing: dict[str, Any], today: str) -> int:
         previous_day = str(existing.get("day", ""))
@@ -456,6 +772,41 @@ class AnimeJrysPlugin(Star):
                 score = random.randint(start, end)
                 return score, tier, random.choice(texts)
         return 100, "最高运势", random.choice(PERFECT_TEXTS)
+
+    def _roll_fortune_excluding_score(self, old_score: int) -> tuple[int, str, str]:
+        for _ in range(30):
+            score, tier, text = self._roll_fortune()
+            if score != old_score:
+                return score, tier, text
+        score = (old_score + random.randint(1, 99)) % 101
+        tier = self._tier_for_score(score)
+        return score, tier, random.choice(self._texts_for_score(score))
+
+    def _tier_for_score(self, score: int) -> str:
+        if score <= 10:
+            return "极低运势"
+        if score < 25:
+            return "低运势"
+        if score < 50:
+            return "中运势"
+        if score < 70:
+            return "偏高运势"
+        if score < 90:
+            return "高运势"
+        if score < 100:
+            return "极高运势"
+        return "最高运势"
+
+    def _texts_for_score(self, score: int) -> list[str]:
+        if score < 25:
+            return LOW_TEXTS
+        if score < 50:
+            return MID_TEXTS
+        if score < 90:
+            return HIGH_TEXTS
+        if score < 100:
+            return GREAT_TEXTS
+        return PERFECT_TEXTS
 
     async def _fetch_random_image(self, blocked_paths: set[str] | None = None) -> ImageCandidate:
         blocked_paths = blocked_paths or set()
@@ -710,6 +1061,12 @@ class AnimeJrysPlugin(Star):
             now,
             protected,
         )
+        self._delete_old_files(
+            self._shop_cache_dir,
+            _config_int(self.config, "shop_image_cache_retention_days", 7, 1, 3650),
+            now,
+            protected,
+        )
         avatar_days = _config_int(self.config, "avatar_cache_days", 5, -1, 3650)
         if avatar_days >= 0:
             self._delete_old_files(self._avatars_dir, max(1, avatar_days), now, protected)
@@ -790,6 +1147,7 @@ class AnimeJrysPlugin(Star):
         total = 0
         for directory in (
             self._cache_dir,
+            self._shop_cache_dir,
             self._avatars_dir,
             self._cards_dir,
             self._trend_cards_dir,
@@ -832,6 +1190,7 @@ class AnimeJrysPlugin(Star):
         enable_wallhaven = _config_bool(self.config, "enable_wallhaven_source", True)
         enable_konachan = _config_bool(self.config, "enable_konachan_source", False)
         enable_safebooru = _config_bool(self.config, "enable_safebooru_source", True)
+        enable_danbooru = _config_bool(self.config, "enable_danbooru_source", False)
         wallhaven_keywords = _split_semicolon(
             _config_get(self.config, "wallhaven_keywords", DEFAULT_WALLHAVEN_KEYWORDS)
         )
@@ -840,6 +1199,9 @@ class AnimeJrysPlugin(Star):
         )
         safebooru_tags = _split_semicolon(
             _config_get(self.config, "safebooru_tags", DEFAULT_SAFEBOORU_TAGS)
+        )
+        danbooru_tags = _split_semicolon(
+            _config_get(self.config, "danbooru_tags", DEFAULT_DANBOORU_TAGS)
         )
         keyword_attempts: list[tuple[str, str]] = []
         fallback_attempts: list[tuple[str, str]] = []
@@ -851,6 +1213,8 @@ class AnimeJrysPlugin(Star):
             keyword_sources.append(("konachan", konachan_tags))
         if enable_safebooru and safebooru_tags:
             keyword_sources.append(("safebooru", safebooru_tags))
+        if enable_danbooru and danbooru_tags:
+            keyword_sources.append(("danbooru_sfw", danbooru_tags))
 
         if keyword_sources:
             for name, values in keyword_sources:
@@ -890,6 +1254,172 @@ class AnimeJrysPlugin(Star):
 
     def _keyword_source_retries(self) -> int:
         return _config_int(self.config, "keyword_source_retries", 1, 0, 3)
+
+    def _shop_image_min_long_edge(self) -> int:
+        return _config_int(self.config, "shop_image_min_long_edge", 1200, 600, 10000)
+
+    async def _fetch_shop_sfw_image(self) -> ImageCandidate:
+        session = await self._get_session()
+        attempts = self._build_source_attempts()
+        for source_name, keyword in attempts:
+            if self._is_source_in_cooldown(source_name):
+                continue
+            try:
+                candidate = await self._resolve_candidate(session, source_name, keyword)
+                if not candidate:
+                    continue
+                local_path = await self._download_and_validate_shop_image(session, candidate)
+                if local_path:
+                    return ImageCandidate(
+                        source=candidate.source,
+                        url=str(local_path),
+                        keyword=candidate.keyword,
+                        credit_url=candidate.credit_url,
+                    )
+            except Exception as exc:
+                status = self._status_from_exception(exc)
+                if status in {403, 429}:
+                    self._cooldown_source(source_name, status)
+                logger.info(f"商店普通图片源 {source_name} 获取失败: {type(exc).__name__}: {exc}")
+        raise RuntimeError("商店普通图片获取失败")
+
+    async def _fetch_shop_nsfw_image(self) -> ImageCandidate:
+        session = await self._get_session()
+        sources = _split_semicolon(_config_get(self.config, "nsfw_sources", DEFAULT_NSFW_SOURCES))
+        if not sources:
+            sources = _split_semicolon(DEFAULT_NSFW_SOURCES)
+        for source_name in sources:
+            source_name = source_name.strip().lower()
+            if not source_name:
+                continue
+            try:
+                candidate = await self._resolve_nsfw_candidate(session, source_name)
+                if not candidate:
+                    continue
+                local_path = await self._download_and_validate_shop_image(session, candidate)
+                if local_path:
+                    return ImageCandidate(
+                        source=candidate.source,
+                        url=str(local_path),
+                        keyword=candidate.keyword,
+                        credit_url=candidate.credit_url,
+                    )
+            except Exception as exc:
+                logger.info(f"商店 NSFW 图片源 {source_name} 获取失败: {type(exc).__name__}: {exc}")
+        raise RuntimeError("商店 NSFW 图片获取失败")
+
+    async def _resolve_nsfw_candidate(
+        self,
+        session: aiohttp.ClientSession,
+        source_name: str,
+    ) -> ImageCandidate | None:
+        excluded_tags = _split_semicolon(
+            _config_get(self.config, "nsfw_excluded_tags", DEFAULT_NSFW_EXCLUDED_TAGS)
+        )
+        if source_name in {"yandere", "yande.re"}:
+            min_score = _config_int(self.config, "yandere_min_score", 20, 0, 10000)
+            min_long_edge = self._shop_image_min_long_edge()
+            query_parts = [
+                "rating:explicit",
+                "order:score",
+                f"score:>{min_score}",
+                f"width:>{min_long_edge}",
+                "height:>600",
+            ]
+            query_parts.extend(f"-{tag}" for tag in excluded_tags)
+            tags = quote_plus(" ".join(query_parts))
+            url = f"https://yande.re/post.json?limit=100&tags={tags}"
+            data = await self._get_json(
+                session,
+                url,
+                timeout_seconds=self._keyword_source_timeout_seconds(),
+                retries=self._keyword_source_retries(),
+            )
+            items = data if isinstance(data, list) else []
+            picked = self._pick_nsfw_item(items, min_score, excluded_tags)
+            if not picked:
+                return None
+            path = self._normalize_remote_image_url(
+                str(picked.get("file_url") or picked.get("sample_url") or "")
+            )
+            if not path:
+                return None
+            return ImageCandidate(
+                source="Yande.re",
+                url=path,
+                keyword="rating:explicit score",
+                credit_url=f"https://yande.re/post/show/{picked.get('id', '')}",
+            )
+
+        if source_name == "danbooru":
+            min_score = _config_int(self.config, "danbooru_min_score", 20, 0, 10000)
+            query_parts = ["rating:e", "order:score", f"score:>={min_score}"]
+            query_parts.extend(f"-{tag}" for tag in excluded_tags)
+            tags = quote_plus(" ".join(query_parts))
+            url = (
+                f"https://danbooru.donmai.us/posts.json?limit=100&tags={tags}"
+                f"{self._danbooru_auth_query()}"
+            )
+            data = await self._get_json(
+                session,
+                url,
+                timeout_seconds=self._keyword_source_timeout_seconds(),
+                retries=self._keyword_source_retries(),
+            )
+            items = data if isinstance(data, list) else []
+            picked = self._pick_nsfw_item(items, min_score, excluded_tags)
+            if not picked:
+                return None
+            path = self._normalize_remote_image_url(
+                str(picked.get("file_url") or picked.get("large_file_url") or "")
+            )
+            if not path:
+                return None
+            return ImageCandidate(
+                source="Danbooru",
+                url=path,
+                keyword="rating:e score",
+                credit_url=f"https://danbooru.donmai.us/posts/{picked.get('id', '')}",
+            )
+
+        if source_name == "gelbooru":
+            min_score = _config_int(self.config, "gelbooru_min_score", 25, 0, 10000)
+            query_parts = ["rating:explicit", "sort:score:desc", f"score:>={min_score}"]
+            query_parts.extend(f"-{tag}" for tag in excluded_tags)
+            tags = quote_plus(" ".join(query_parts))
+            url = (
+                "https://gelbooru.com/index.php"
+                f"?page=dapi&s=post&q=index&json=1&limit=100&tags={tags}"
+                f"{self._gelbooru_auth_query()}"
+            )
+            data = await self._get_json(
+                session,
+                url,
+                timeout_seconds=self._keyword_source_timeout_seconds(),
+                retries=self._keyword_source_retries(),
+            )
+            if isinstance(data, dict):
+                items = data.get("post", [])
+                if isinstance(items, dict):
+                    items = [items]
+            else:
+                items = data if isinstance(data, list) else []
+            picked = self._pick_nsfw_item(items, min_score, excluded_tags)
+            if not picked:
+                return None
+            path = self._normalize_remote_image_url(
+                str(picked.get("file_url") or picked.get("sample_url") or "")
+            )
+            if not path:
+                return None
+            return ImageCandidate(
+                source="Gelbooru",
+                url=path,
+                keyword="rating:explicit score",
+                credit_url=f"https://gelbooru.com/index.php?page=post&s=view&id={picked.get('id', '')}",
+            )
+
+        return None
 
     async def _resolve_candidate(
         self,
@@ -986,6 +1516,49 @@ class AnimeJrysPlugin(Star):
                 credit_url=f"https://safebooru.org/index.php?page=post&s=view&id={picked.get('id', '')}",
             )
 
+        if source_name == "danbooru_sfw":
+            min_score = _config_int(self.config, "danbooru_sfw_min_score", 20, 0, 10000)
+            excluded_tags = _split_semicolon(
+                _config_get(
+                    self.config,
+                    "danbooru_sfw_excluded_tags",
+                    DEFAULT_SAFEBOORU_EXCLUDED_TAGS,
+                )
+            )
+            query_parts = [
+                "rating:s",
+                keyword,
+                "order:score",
+                f"score:>={min_score}",
+            ]
+            query_parts.extend(f"-{tag}" for tag in excluded_tags)
+            tags = quote_plus(" ".join(query_parts))
+            url = (
+                f"https://danbooru.donmai.us/posts.json?limit=100&tags={tags}"
+                f"{self._danbooru_auth_query()}"
+            )
+            data = await self._get_json(
+                session,
+                url,
+                timeout_seconds=self._keyword_source_timeout_seconds(),
+                retries=self._keyword_source_retries(),
+            )
+            items = data if isinstance(data, list) else []
+            picked = self._pick_danbooru_sfw_item(items, min_score, excluded_tags)
+            if not picked:
+                return None
+            path = self._normalize_remote_image_url(
+                str(picked.get("file_url") or picked.get("large_file_url") or "")
+            )
+            if not path:
+                return None
+            return ImageCandidate(
+                source="Danbooru",
+                url=path,
+                keyword=keyword,
+                credit_url=f"https://danbooru.donmai.us/posts/{picked.get('id', '')}",
+            )
+
         if source_name == "zhuqiy":
             return ImageCandidate(
                 source="ZHUQIY",
@@ -1052,6 +1625,107 @@ class AnimeJrysPlugin(Star):
             return None
         candidates.sort(key=lambda item: int(item.get("score", 0) or 0), reverse=True)
         return random.choice(candidates[: min(len(candidates), 12)])
+
+    def _pick_danbooru_sfw_item(
+        self,
+        items: list[Any],
+        min_score: int,
+        excluded_tags: list[str],
+    ) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+        excluded = {tag.lower().strip().replace(" ", "_") for tag in excluded_tags if tag.strip()}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tags = self._tags_from_item(item)
+            if tags.intersection(excluded):
+                continue
+            rating = str(item.get("rating", "") or "").lower()
+            if rating not in {"s", "safe"}:
+                continue
+            try:
+                width = int(item.get("image_width", item.get("width", 0)) or 0)
+                height = int(item.get("image_height", item.get("height", 0)) or 0)
+                score = int(item.get("score", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if score < min_score:
+                continue
+            if width < 1000 or height < 700 or width / max(height, 1) < 1.1:
+                continue
+            path = self._normalize_remote_image_url(
+                str(item.get("file_url") or item.get("large_file_url") or "")
+            )
+            if not path:
+                continue
+            suffix = Path(urlparse(path).path).suffix.lower()
+            if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+                continue
+            candidates.append(item)
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: int(item.get("score", 0) or 0), reverse=True)
+        return random.choice(candidates[: min(len(candidates), 12)])
+
+    def _pick_nsfw_item(
+        self,
+        items: list[Any],
+        min_score: int,
+        excluded_tags: list[str],
+    ) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+        excluded = {tag.lower().strip().replace(" ", "_") for tag in excluded_tags if tag.strip()}
+        min_long_edge = self._shop_image_min_long_edge()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tags = self._tags_from_item(item)
+            if tags.intersection(excluded):
+                continue
+            try:
+                width = int(item.get("image_width", item.get("width", 0)) or 0)
+                height = int(item.get("image_height", item.get("height", 0)) or 0)
+                score = int(item.get("score", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if score < min_score:
+                continue
+            if max(width, height) < min_long_edge or min(width, height) < 600:
+                continue
+            path = self._normalize_remote_image_url(
+                str(item.get("file_url") or item.get("large_file_url") or item.get("sample_url") or "")
+            )
+            if not path:
+                continue
+            suffix = Path(urlparse(path).path).suffix.lower()
+            if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+                continue
+            candidates.append(item)
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: int(item.get("score", 0) or 0), reverse=True)
+        return random.choice(candidates[: min(len(candidates), 20)])
+
+    def _tags_from_item(self, item: dict[str, Any]) -> set[str]:
+        if isinstance(item.get("tag_string"), str):
+            raw = item.get("tag_string", "")
+        else:
+            raw = item.get("tags", "")
+        return {
+            tag.lower().strip().replace(" ", "_")
+            for tag in str(raw or "").replace("\n", " ").split()
+            if tag.strip()
+        }
+
+    def _normalize_remote_image_url(self, url: str) -> str:
+        text = str(url or "").strip()
+        if text.startswith("//"):
+            return "https:" + text
+        if text.startswith("http://") or text.startswith("https://"):
+            return text
+        return ""
 
     async def _get_json(
         self,
@@ -1120,6 +1794,44 @@ class AnimeJrysPlugin(Star):
         finally:
             tmp.unlink(missing_ok=True)
 
+    async def _download_and_validate_shop_image(
+        self,
+        session: aiohttp.ClientSession,
+        candidate: ImageCandidate,
+    ) -> Path | None:
+        cache_key = _sha256_text(candidate.url)
+        ext = self._extension_from_url(candidate.url)
+        dest = self._shop_cache_dir / f"{cache_key}{ext}"
+        is_random_endpoint = "api/random" in candidate.url
+        if (not is_random_endpoint) and dest.exists() and self._is_valid_shop_image(dest):
+            return dest
+
+        tmp = self._shop_cache_dir / f"{cache_key}.tmp"
+        try:
+            async with session.get(candidate.url, headers=HTTP_HEADERS) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("Content-Type", "")
+                data = await resp.read()
+                if "image" not in content_type.lower() and not data.startswith(
+                    (b"\xff\xd8", b"\x89PNG", b"RIFF")
+                ):
+                    logger.info(f"跳过商店非图片响应: {candidate.source} {content_type}")
+                    return None
+            await asyncio.to_thread(tmp.write_bytes, data)
+            if not await asyncio.to_thread(self._is_valid_shop_image, tmp):
+                tmp.unlink(missing_ok=True)
+                return None
+            content_ext = self._extension_from_content_type(content_type)
+            if is_random_endpoint:
+                cache_key = hashlib.sha256(data).hexdigest()
+                dest = self._shop_cache_dir / f"{cache_key}{content_ext or ext}"
+                if dest.exists() and self._is_valid_shop_image(dest):
+                    return dest
+            tmp.replace(dest)
+            return dest
+        finally:
+            tmp.unlink(missing_ok=True)
+
     def _is_valid_landscape_image(self, path: Path) -> bool:
         try:
             with Image.open(path) as img:
@@ -1127,6 +1839,15 @@ class AnimeJrysPlugin(Star):
                 return width >= 1000 and height >= 700 and width / max(height, 1) >= 1.1
         except Exception as exc:
             logger.info(f"图片校验失败，继续尝试其他图片: {path} | {exc}")
+            return False
+
+    def _is_valid_shop_image(self, path: Path) -> bool:
+        try:
+            with Image.open(path) as img:
+                width, height = img.size
+                return max(width, height) >= self._shop_image_min_long_edge() and min(width, height) >= 600
+        except Exception as exc:
+            logger.info(f"商店图片校验失败，继续尝试其他图片: {path} | {exc}")
             return False
 
     def _extension_from_url(self, url: str) -> str:
@@ -1406,6 +2127,8 @@ class AnimeJrysPlugin(Star):
         image_keyword: str,
         display_name: str = "",
         avatar_path: str = "",
+        coin_gain: int = 0,
+        coins: int = 0,
     ) -> None:
         if _config_bool(self.config, "enable_shared_base_cards", True):
             base_path = self._base_card_path(image_path, image_source, image_keyword)
@@ -1425,6 +2148,12 @@ class AnimeJrysPlugin(Star):
         accent = self._accent_for_score(score)
         draw.text((86, 838), str(score), font=font_large, fill=accent)
         draw.text((90, 1006), "今日运势", font=font_small, fill=(98, 87, 78))
+        if self._coin_system_enabled():
+            if coin_gain > 0:
+                coin_text = f"金币 +{coin_gain} | 余额 {coins}/{self._coin_cap()}"
+            else:
+                coin_text = f"金币余额 {coins}/{self._coin_cap()}"
+            draw.text((250, 1006), coin_text, font=font_small, fill=(148, 116, 70))
 
         wrapped = self._wrap_text(text, font_body, 820)
         y = 1046
