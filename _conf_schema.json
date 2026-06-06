@@ -84,15 +84,15 @@
     "default": "1"
   },
   "enable_zhuqiy_fallback": {
-    "description": "启用 ZHUQIY 泛二次元兜底源",
+    "description": "启用 ZHUQIY 通用横图兜底源",
     "type": "bool",
-    "hint": "关键词源全部失败后，使用 ZHUQIY 的 PC 横图随机接口作为兜底。",
-    "default": true
+    "hint": "默认关闭。ZHUQIY 的 PC 横图接口可能混入现实/通用壁纸；只想要动漫图时请保持关闭。",
+    "default": false
   },
   "enable_waifu_im_fallback": {
     "description": "启用 Waifu.im 泛二次元兜底源",
     "type": "bool",
-    "hint": "关键词源和 ZHUQIY 都失败后，使用 Waifu.im 的横图接口作为兜底。",
+    "hint": "关键词源失败后，使用 Waifu.im 的横图接口作为动漫兜底。",
     "default": true
   },
   "show_image_source_notice": {
@@ -239,16 +239,22 @@
     "hint": "默认 60。用户发送 jrsd 后，只有该用户在有效期内输入 1/2/3 才能购买。",
     "default": "60"
   },
+  "shop_sfw_sources": {
+    "description": "商店普通图片图源顺序",
+    "type": "text",
+    "hint": "默认 wallhaven;safebooru;waifu_im。可用值：wallhaven、konachan、safebooru、danbooru、waifu_im、zhuqiy。多个图源用英文分号 ; 分隔。商品 2 会按这里的顺序尝试。",
+    "default": "wallhaven;safebooru;waifu_im"
+  },
   "enable_nsfw_shop": {
     "description": "启用 18+ 商店商品",
     "type": "bool",
     "hint": "默认开启。公开群聊使用前请确认机器人所在群规则和平台规范。",
     "default": true
   },
-  "nsfw_sources": {
-    "description": "18+ 图源顺序",
+  "shop_nsfw_sources": {
+    "description": "商店 18+ 图片图源顺序",
     "type": "text",
-    "hint": "默认 yandere;danbooru;gelbooru。多个图源用英文分号 ; 分隔。Danbooru / Gelbooru 在部分服务器上可能需要登录或 API 权限，Yande.re 通常更适合作为无鉴权默认源。",
+    "hint": "默认 yandere;danbooru;gelbooru。可用值：yandere、danbooru、gelbooru。多个图源用英文分号 ; 分隔。商品 3 会按这里的顺序尝试。旧配置 nsfw_sources 仍会兼容读取。",
     "default": "yandere;danbooru;gelbooru"
   },
   "yandere_min_score": {

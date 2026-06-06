@@ -91,6 +91,7 @@ DEFAULT_NSFW_EXCLUDED_TAGS = (
     "comic;manga;sketch;lowres;bad_anatomy;translation_request"
 )
 DEFAULT_NSFW_SOURCES = "yandere;danbooru;gelbooru"
+DEFAULT_SHOP_SFW_SOURCES = "wallhaven;safebooru;waifu_im"
 
 TRIGGER_WORDS = {"jrys", "今日运势", "运势"}
 TREND_TRIGGER_WORDS = {"ysqs", "运势趋势", "趋势"}
@@ -1000,8 +1001,26 @@ class AnimeJrysPlugin(Star):
         tmp.replace(self._pool_file)
 
     def _pool_entry_is_valid(self, entry: dict[str, Any]) -> bool:
+        if not self._pool_entry_source_enabled(entry):
+            return False
         path = Path(str(entry.get("image_path", "")))
         return path.exists() and self._is_valid_landscape_image(path)
+
+    def _pool_entry_source_enabled(self, entry: dict[str, Any]) -> bool:
+        source = str(entry.get("source", "") or "").strip().lower()
+        if source == "wallhaven":
+            return _config_bool(self.config, "enable_wallhaven_source", True)
+        if source == "konachan":
+            return _config_bool(self.config, "enable_konachan_source", False)
+        if source == "safebooru":
+            return _config_bool(self.config, "enable_safebooru_source", True)
+        if source == "danbooru":
+            return _config_bool(self.config, "enable_danbooru_source", False)
+        if source == "zhuqiy":
+            return _config_bool(self.config, "enable_zhuqiy_fallback", False)
+        if source in {"waifu.im", "waifu_im", "waifu"}:
+            return _config_bool(self.config, "enable_waifu_im_fallback", True)
+        return True
 
     def _pool_entry_is_blocked(self, entry: dict[str, Any], blocked_paths: set[str]) -> bool:
         path_text = str(entry.get("image_path", "") or "")
@@ -1236,13 +1255,63 @@ class AnimeJrysPlugin(Star):
             for name, values in keyword_sources:
                 keyword_attempts.append((name, random.choice(values)))
 
-        if _config_bool(self.config, "enable_zhuqiy_fallback", True):
+        if _config_bool(self.config, "enable_zhuqiy_fallback", False):
             fallback_attempts.append(("zhuqiy", ""))
         if _config_bool(self.config, "enable_waifu_im_fallback", True):
             fallback_attempts.append(("waifu_im", ""))
 
         random.shuffle(fallback_attempts)
         return keyword_attempts + fallback_attempts
+
+    def _build_shop_sfw_source_attempts(self) -> list[tuple[str, str]]:
+        source_names = _split_semicolon(
+            _config_get(self.config, "shop_sfw_sources", DEFAULT_SHOP_SFW_SOURCES)
+        )
+        if not source_names:
+            return self._build_source_attempts()
+
+        attempts: list[tuple[str, str]] = []
+        for source_name in source_names:
+            canonical = source_name.strip().lower()
+            if canonical in {"waifu", "waifu.im", "waifu_im"}:
+                attempts.append(("waifu_im", ""))
+                continue
+            if canonical == "zhuqiy":
+                attempts.append(("zhuqiy", ""))
+                continue
+            values = self._keyword_values_for_source(canonical)
+            if values:
+                attempts.append((self._canonical_sfw_source_name(canonical), random.choice(values)))
+        return attempts
+
+    def _keyword_values_for_source(self, source_name: str) -> list[str]:
+        if source_name == "wallhaven":
+            return _split_semicolon(
+                _config_get(self.config, "wallhaven_keywords", DEFAULT_WALLHAVEN_KEYWORDS)
+            )
+        if source_name == "konachan":
+            return _split_semicolon(_config_get(self.config, "konachan_tags", DEFAULT_KONACHAN_TAGS))
+        if source_name == "safebooru":
+            return _split_semicolon(
+                _config_get(self.config, "safebooru_tags", DEFAULT_SAFEBOORU_TAGS)
+            )
+        if source_name in {"danbooru", "danbooru_sfw"}:
+            return _split_semicolon(_config_get(self.config, "danbooru_tags", DEFAULT_DANBOORU_TAGS))
+        return []
+
+    def _canonical_sfw_source_name(self, source_name: str) -> str:
+        if source_name in {"danbooru", "danbooru_sfw"}:
+            return "danbooru_sfw"
+        return source_name
+
+    def _shop_nsfw_sources(self) -> list[str]:
+        configured = str(_config_get(self.config, "shop_nsfw_sources", "") or "").strip()
+        legacy = str(_config_get(self.config, "nsfw_sources", "") or "").strip()
+        if legacy and (not configured or configured == DEFAULT_NSFW_SOURCES):
+            configured = legacy
+        if not configured:
+            configured = DEFAULT_NSFW_SOURCES
+        return _split_semicolon(configured)
 
     def _is_source_in_cooldown(self, source_name: str) -> bool:
         until = self._source_cooldowns.get(source_name, 0)
@@ -1276,7 +1345,7 @@ class AnimeJrysPlugin(Star):
 
     async def _fetch_shop_sfw_image(self) -> ImageCandidate:
         session = await self._get_session()
-        attempts = self._build_source_attempts()
+        attempts = self._build_shop_sfw_source_attempts()
         for source_name, keyword in attempts:
             if self._is_source_in_cooldown(source_name):
                 continue
@@ -1301,7 +1370,7 @@ class AnimeJrysPlugin(Star):
 
     async def _fetch_shop_nsfw_image(self) -> ImageCandidate:
         session = await self._get_session()
-        sources = _split_semicolon(_config_get(self.config, "nsfw_sources", DEFAULT_NSFW_SOURCES))
+        sources = self._shop_nsfw_sources()
         if not sources:
             sources = _split_semicolon(DEFAULT_NSFW_SOURCES)
         for source_name in sources:
@@ -1335,37 +1404,59 @@ class AnimeJrysPlugin(Star):
         if source_name in {"yandere", "yande.re"}:
             min_score = _config_int(self.config, "yandere_min_score", 20, 0, 10000)
             min_long_edge = self._shop_image_min_long_edge()
-            query_parts = [
-                "rating:explicit",
-                "order:score",
-                f"score:>{min_score}",
-                f"width:>{min_long_edge}",
-                "height:>600",
+            query_variants = [
+                [
+                    "rating:explicit",
+                    "order:score",
+                    f"score:>{min_score}",
+                    f"width:>{min_long_edge}",
+                    "height:>600",
+                ],
+                [
+                    "rating:explicit",
+                    f"score:>{min_score}",
+                    f"width:>{min_long_edge}",
+                    "height:>600",
+                ],
+                [
+                    "rating:explicit",
+                    f"width:>{min_long_edge}",
+                    "height:>600",
+                ],
             ]
-            query_parts.extend(f"-{tag}" for tag in excluded_tags)
-            tags = quote_plus(" ".join(query_parts))
-            url = f"https://yande.re/post.json?limit=100&tags={tags}"
-            data = await self._get_json(
-                session,
-                url,
-                timeout_seconds=self._keyword_source_timeout_seconds(),
-                retries=self._keyword_source_retries(),
-            )
-            items = data if isinstance(data, list) else []
-            picked = self._pick_nsfw_item(items, min_score, excluded_tags)
-            if not picked:
-                return None
-            path = self._normalize_remote_image_url(
-                str(picked.get("file_url") or picked.get("sample_url") or "")
-            )
-            if not path:
-                return None
-            return ImageCandidate(
-                source="Yande.re",
-                url=path,
-                keyword="rating:explicit score",
-                credit_url=f"https://yande.re/post/show/{picked.get('id', '')}",
-            )
+            pages = [1]
+            pages.extend(random.sample(range(2, 10), k=3))
+            for query_parts in query_variants:
+                query_parts = [*query_parts, *(f"-{tag}" for tag in excluded_tags)]
+                tags = quote_plus(" ".join(query_parts))
+                for page in pages:
+                    url = f"https://yande.re/post.json?limit=100&page={page}&tags={tags}"
+                    try:
+                        data = await self._get_json(
+                            session,
+                            url,
+                            timeout_seconds=self._keyword_source_timeout_seconds(),
+                            retries=0,
+                        )
+                    except Exception as exc:
+                        status = self._status_from_exception(exc)
+                        if status in {400, 422}:
+                            break
+                        raise
+                    items = data if isinstance(data, list) else []
+                    picked = self._pick_nsfw_item(items, min_score, excluded_tags)
+                    if not picked:
+                        continue
+                    path = self._nsfw_image_url_from_item(picked)
+                    if not path:
+                        continue
+                    return ImageCandidate(
+                        source="Yande.re",
+                        url=path,
+                        keyword="rating:explicit score",
+                        credit_url=f"https://yande.re/post/show/{picked.get('id', '')}",
+                    )
+            return None
 
         if source_name == "danbooru":
             min_score = _config_int(self.config, "danbooru_min_score", 20, 0, 10000)
@@ -1386,9 +1477,7 @@ class AnimeJrysPlugin(Star):
             picked = self._pick_nsfw_item(items, min_score, excluded_tags)
             if not picked:
                 return None
-            path = self._normalize_remote_image_url(
-                str(picked.get("file_url") or picked.get("large_file_url") or "")
-            )
+            path = self._nsfw_image_url_from_item(picked)
             if not path:
                 return None
             return ImageCandidate(
@@ -1423,9 +1512,7 @@ class AnimeJrysPlugin(Star):
             picked = self._pick_nsfw_item(items, min_score, excluded_tags)
             if not picked:
                 return None
-            path = self._normalize_remote_image_url(
-                str(picked.get("file_url") or picked.get("sample_url") or "")
-            )
+            path = self._nsfw_image_url_from_item(picked)
             if not path:
                 return None
             return ImageCandidate(
@@ -1710,7 +1797,13 @@ class AnimeJrysPlugin(Star):
             if max(width, height) < min_long_edge or min(width, height) < 600:
                 continue
             path = self._normalize_remote_image_url(
-                str(item.get("file_url") or item.get("large_file_url") or item.get("sample_url") or "")
+                str(
+                    item.get("file_url")
+                    or item.get("large_file_url")
+                    or item.get("jpeg_url")
+                    or item.get("sample_url")
+                    or ""
+                )
             )
             if not path:
                 continue
@@ -1723,6 +1816,13 @@ class AnimeJrysPlugin(Star):
             return None
         candidates.sort(key=lambda item: int(item.get("score", 0) or 0), reverse=True)
         return random.choice(candidates[: min(len(candidates), 20)])
+
+    def _nsfw_image_url_from_item(self, item: dict[str, Any]) -> str:
+        for key in ("file_url", "large_file_url", "jpeg_url", "sample_url"):
+            path = self._normalize_remote_image_url(str(item.get(key) or ""))
+            if path:
+                return path
+        return ""
 
     def _tags_from_item(self, item: dict[str, Any]) -> set[str]:
         if isinstance(item.get("tag_string"), str):
